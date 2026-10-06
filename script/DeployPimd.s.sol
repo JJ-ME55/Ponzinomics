@@ -41,6 +41,10 @@ contract DeployPimd is Script {
     int24 constant ROBINHOOD_START_TICK = 147780; // ~2.62M PIMD per IMD, IMD near $13
     int24 constant RANGE_TICKS = 46020; // the same ~100x span v1 used, so the range tops out near $500k
     int24 constant SPACING = 60;
+    /// Where the team's 20% goes, and who holds the two one-shot powers. Baked in rather than read from the
+    /// environment so that whoever runs this script, including a deployer that is not us, produces the same
+    /// launch. Both are overridable for tests and rehearsals.
+    address constant DEFAULT_TEAM = 0xdD48c714e71560670b8ba3f7C17040843B862846;
 
     uint160 constant FLAGS = uint160(
         Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
@@ -50,11 +54,11 @@ contract DeployPimd is Script {
     function run() external {
         uint256 pk = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(pk);
-        address teamWallet = vm.envAddress("TEAM_MULTISIG");
+        address teamWallet = vm.envOr("TEAM_MULTISIG", DEFAULT_TEAM);
         require(teamWallet != address(0), "TEAM_MULTISIG required");
         // Whoever sends the deployment transaction, these two one-shot powers belong to LAUNCH_ADMIN: the hook's
         // launcher and the engine's binder. The swarm deploys from its own wallet, so this must not be msg.sender.
-        address launchAdmin = vm.envOr("LAUNCH_ADMIN", deployer);
+        address launchAdmin = vm.envOr("LAUNCH_ADMIN", teamWallet);
         require(launchAdmin != address(0), "LAUNCH_ADMIN required");
 
         bool mainnet = block.chainid == 1;
