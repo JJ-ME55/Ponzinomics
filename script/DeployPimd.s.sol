@@ -44,7 +44,7 @@ contract DeployPimd is Script {
     /// Where the team's 20% goes, and who holds the two one-shot powers. Baked in rather than read from the
     /// environment so that whoever runs this script, including a deployer that is not us, produces the same
     /// launch. Both are overridable for tests and rehearsals.
-    address constant DEFAULT_TEAM = 0xdD48c714e71560670b8ba3f7C17040843B862846;
+    address constant DEFAULT_TEAM = 0x0960E8Bd80462e3842Bb6620c7C5289A44c4559B;
 
     uint160 constant FLAGS = uint160(
         Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
