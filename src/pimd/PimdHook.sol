@@ -86,7 +86,7 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// getters purely so tests can point them at local doubles; the production path returns these constants.
     address internal constant TEAM_WALLET = 0x0960E8Bd80462e3842Bb6620c7C5289A44c4559B;
     /// @dev The engine is deployed by us before the launch request goes out, and its address written here.
-    address internal constant ENGINE_ADDRESS = 0x0000000000000000000000000000000000000000;
+    address internal constant ENGINE_ADDRESS = 0x92A9ABEB52031D529AB1ae3638CA073fa12Be01d;
 
     uint32 public constant launchCapSeconds = 600;
     uint32 public constant launchCapBlocks = 6_000;
