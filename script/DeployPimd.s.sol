@@ -38,7 +38,7 @@ contract DeployPimd is Script {
     address constant MAINNET_IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
     // Opening ticks for a ~$5k market cap. Price moves, so recompute on the day and pass START_TICK.
     int24 constant MAINNET_START_TICK = 146460; // ~2.29M PIMD per IMD, IMD near $11.47
-    int24 constant ROBINHOOD_START_TICK = 147780; // ~2.62M PIMD per IMD, IMD near $13
+    int24 constant ROBINHOOD_START_TICK = 144120; // ~1.81M PIMD per IMD, IMD near $9.07, a $5,001 open
     int24 constant RANGE_TICKS = 46020; // the same ~100x span v1 used, so the range tops out near $500k
     int24 constant SPACING = 60;
     /// Where the team's 20% goes, and who holds the two one-shot powers. Baked in rather than read from the
