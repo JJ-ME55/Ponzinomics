@@ -39,14 +39,15 @@ contract PimdForkTest is Test {
     // Defaults are Robinhood Chain; override to run the same suite against another chain's IMD.
     address POOL_MANAGER = vm.envOr("POOL_MANAGER", 0x8366a39CC670B4001A1121B8F6A443A643e40951);
     address IMD = vm.envOr("IMD", 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127);
-    int24 START_TICK = int24(vm.envOr("START_TICK", int256(147780)));
-    int24 TICK_LOWER = int24(vm.envOr("TICK_LOWER", int256(101760)));
+    int24 START_TICK = int24(vm.envOr("START_TICK", int256(129000)));
+    int24 TICK_LOWER = int24(vm.envOr("TICK_LOWER", int256(82980)));
     int24 constant SPACING = 60;
     uint256 constant BPS = 10_000;
 
     uint160 constant FLAGS = uint160(
         Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
             | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
+            | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
     );
 
     IPoolManager manager;
@@ -166,7 +167,9 @@ contract PimdForkTest is Test {
         assertTrue(hook.launched(), "launched on the real PoolManager");
         assertEq(Currency.unwrap(key.currency0), IMD, "real IMD is currency0");
         assertEq(Currency.unwrap(key.currency1), address(token), "PIMD is currency1");
-        assertEq(token.balanceOf(POOL_MANAGER), token.totalSupply(), "whole supply seeded");
+        // the launch policy seeds ninety percent single-sided; the rest goes where the launch says
+        assertGt(token.balanceOf(POOL_MANAGER), token.totalSupply() * 85 / 100, "most of the supply is seeded");
+        assertEq(token.totalSupply(), 1_000_000_000e18, "supply is fixed at a billion");
         assertEq(imd.decimals(), 18, "IMD is 18 decimals, as the tax maths assumes");
     }
 
@@ -176,7 +179,7 @@ contract PimdForkTest is Test {
         uint256 got = _buy(alice, spend);
 
         assertGt(got, 0, "alice got PIMD");
-        assertEq(hook.totalTaxed(), spend * 300 / BPS, "3% in real IMD");
+        assertEq(hook.totalTaxed(), spend * 240 / BPS, "the buy tax, in real IMD");
         assertEq(hook.claimBalance(), hook.totalTaxed(), "held as claims against the real token");
         assertEq(imd.balanceOf(POOL_MANAGER) - pmBefore, spend, "every IMD of it settled into the manager");
     }
