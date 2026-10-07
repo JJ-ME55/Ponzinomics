@@ -19,7 +19,7 @@ import {PimdHook, IPimdToken} from "../../src/pimd/PimdHook.sol";
 import {PimdEngine} from "../../src/pimd/PimdEngine.sol";
 import {L2Block} from "../../src/libraries/L2Block.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
-import {PimdHookHarness} from "./PimdBase.t.sol";
+import {PimdHookHarness, MockLaunchFactory} from "./PimdBase.t.sol";
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -55,6 +55,7 @@ contract PimdForkTest is Test {
     IERC20 imd;
     PoolSwapTest router;
     PoolModifyLiquidityTest lpRouter;
+    MockLaunchFactory factory;
     PimdToken token;
     PimdHook hook;
     PimdEngine engine;
@@ -74,6 +75,7 @@ contract PimdForkTest is Test {
 
         router = new PoolSwapTest(manager);
         lpRouter = new PoolModifyLiquidityTest(manager);
+        factory = new MockLaunchFactory(manager);
         engine = new PimdEngine(
             PimdEngine.Config({
                 poolManager: POOL_MANAGER,
@@ -101,10 +103,10 @@ contract PimdForkTest is Test {
         }
         require(address(token) != address(0) && uint160(address(token)) > uint160(IMD), "token order");
 
-        bytes memory args = abi.encode(manager, address(token), address(engine), team, IMD, address(this));
+        bytes memory args = abi.encode(manager, address(token), address(engine), team, IMD, address(factory));
         (address hookAddr, bytes32 hookSalt) =
             HookMiner.find(address(this), FLAGS, type(PimdHookHarness).creationCode, args);
-        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team, IMD, address(this)))));
+        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team, IMD, address(factory)))));
         require(address(hook) == hookAddr, "hook addr");
 
         // Open and seed the pool the way the factory will: from outside, through the PoolManager.
@@ -115,23 +117,13 @@ contract PimdForkTest is Test {
             tickSpacing: SPACING,
             hooks: IHooks(address(hook))
         });
-        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+        factory.open(k, TickMath.getSqrtPriceAtTick(START_TICK));
         uint256 seed = token.balanceOf(address(this)) * 9 / 10;
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
             TickMath.getSqrtPriceAtTick(TICK_LOWER), TickMath.getSqrtPriceAtTick(START_TICK), seed
         );
-        token.approve(address(lpRouter), type(uint256).max);
-        imd.approve(address(lpRouter), type(uint256).max);
-        lpRouter.modifyLiquidity(
-            k,
-            ModifyLiquidityParams({
-                tickLower: TICK_LOWER,
-                tickUpper: START_TICK,
-                liquidityDelta: int256(uint256(liquidity)),
-                salt: 0
-            }),
-            ""
-        );
+        token.transfer(address(factory), seed);
+        factory.seed(k, TICK_LOWER, START_TICK, liquidity);
         engine.bind(address(token), address(hook));
         key = hook.poolKey();
 
