@@ -7,6 +7,8 @@ evm_version = "cancun"
 optimizer = true
 optimizer_runs = 44444444
 via_ir = true
+# A launch compares deployed bytes against a local build, so the metadata hash must not be in them.
+bytecode_hash = "none"
 fs_permissions = [{ access = "read-write", path = "./" }]
 ffi = false
 
