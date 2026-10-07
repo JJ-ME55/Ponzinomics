@@ -19,7 +19,6 @@ import {L2Block} from "../libraries/L2Block.sol";
 interface IPimdToken {
     function balanceOf(address) external view returns (uint256);
     function transfer(address, uint256) external returns (bool);
-    function burn(uint256) external;
 }
 
 interface IERC20Quote {
@@ -55,64 +54,76 @@ contract PimdHook is IHooks, IUnlockCallback {
 
     // ------------------------------------------------------------------ constants
     uint256 public constant BPS = 10_000;
-    uint256 public constant BUY_TAX_BPS = 300; // 3%
-    uint256 public constant SELL_TAX_BPS = 700; // 7%
-    uint256 public constant HOLDERS_BPS = 6_000; // 60% of the tax
-    uint256 public constant BURN_BPS = 2_000; // 20% of the tax; the team gets the remaining 20%
+    uint256 public constant BUY_TAX_BPS = 240; // 2.4%, and the pool charges 1.25% on top
+    uint256 public constant SELL_TAX_BPS = 560; // 5.6%, likewise
+    uint256 public constant HOLDERS_BPS = 7_500; // 75% of the tax; the team gets the remaining 25%
+    /// @dev The burn takes nothing from the tax any more. It is funded by the pool's own 1.25% fee, which
+    /// pays the launch's paying wallet: the PIMD half is burned as it arrives, the IMD half buys PIMD and
+    /// burns that. Holders and the team keep exactly the share of a trade they had before.
     /// @dev Fail-open bound on the block-based launch cap. On Arbitrum Orbit `block.number` is the L1 block, so
     /// if the ArbSys precompile ever stopped answering, the block test alone would keep the cap on forever.
     uint256 public constant LAUNCH_CAP_MAX_SECONDS = 1 hours;
+    /// @notice The tick the launch policy's 2,500 IMD opening cap implies on a one billion supply, with PIMD
+    /// as currency1: 2.5e-6 IMD per PIMD. Initialization is refused outside the tolerance, so a mispriced
+    /// pool fails loudly instead of opening.
+    int24 public constant LAUNCH_TICK = 129_000;
+    int24 public constant LAUNCH_TICK_TOLERANCE = 300;
+    /// @notice Fee tiers the launch factory is allowed to open this pool with.
+    uint24 internal constant FEE_TIER_LOW = 500;
+    uint24 internal constant FEE_TIER_MID = 3_000;
+    uint24 internal constant FEE_TIER_HIGH = 10_000;
+    uint24 internal constant FEE_TIER_LAUNCH = 12_500;
 
-    uint8 private constant ACTION_SEED = 1;
     uint8 private constant ACTION_FLUSH = 2;
-    uint8 private constant ACTION_PAYOUTS = 3;
 
     uint256 private constant _FEE_SLOT = uint256(keccak256("pimd.hook.fee")) - 1;
     uint256 private constant _UNLOCK_SLOT = uint256(keccak256("pimd.hook.unlocking")) - 1;
     uint256 private constant _INSWAP_SLOT = uint256(keccak256("pimd.hook.inswap")) - 1;
 
-    struct Config {
-        uint32 launchCapSeconds; // how long the per-buyer cap applies
-        uint32 launchCapBlocks; // and the block-count bound on the same window
-        uint128 launchBuyCap; // IMD one tx.origin may spend during that window (0 = no cap)
-        uint128 burnThreshold; // burn budget that arms the buy-and-burn
-        uint128 burnCap; // most IMD one buy-and-burn may spend
-        uint128 callerTip; // IMD paid to whoever calls flush, taken from the team's slice only
-    }
+    // ------------------------------------------------------------------ fixed wiring
+    /// @dev The launch factory constructs this hook with the pool manager and the token and nothing else, so
+    /// everything else it needs is written here rather than passed in. Both are read through `virtual`
+    /// getters purely so tests can point them at local doubles; the production path returns these constants.
+    address internal constant TEAM_WALLET = 0x0960E8Bd80462e3842Bb6620c7C5289A44c4559B;
+    /// @dev The engine is deployed by us before the launch request goes out, and its address written here.
+    address internal constant ENGINE_ADDRESS = 0x0000000000000000000000000000000000000000;
+
+    uint32 public constant launchCapSeconds = 600;
+    uint32 public constant launchCapBlocks = 6_000;
+    uint128 public constant launchBuyCap = 25e18; // IMD one tx.origin may spend in the launch window
+    uint128 public constant callerTip = 0.01e18; // paid to whoever calls flush, out of the team's slice only
 
     // ------------------------------------------------------------------ immutables
     IPoolManager public immutable poolManager;
-    Currency public immutable quote; // IMD
-    uint256 public immutable quoteId; // the ERC-6909 id of IMD claims
-    address public immutable engine; // receives the holders' slice as real IMD
-    address public immutable team;
-    address public immutable launcher;
-    uint32 public immutable launchCapSeconds;
-    uint32 public immutable launchCapBlocks;
-    uint128 public immutable launchBuyCap;
-    uint128 public immutable burnThreshold;
-    uint128 public immutable burnCap;
-    uint128 public immutable callerTip;
+    IPimdToken public immutable token;
+
+    /// @notice The paired currency, learned from the pool key when the factory opens the pool.
+    Currency public quote; // IMD
+    uint256 public quoteId; // the ERC-6909 id of IMD claims
+
+    /// @notice Receives the holders' slice as real IMD.
+    function engine() public view virtual returns (address) {
+        return ENGINE_ADDRESS;
+    }
+
+    /// @notice Receives the team's slice, always in IMD. It never holds or sells PIMD.
+    function team() public view virtual returns (address) {
+        return TEAM_WALLET;
+    }
 
     // ------------------------------------------------------------------ state
-    IPimdToken public token;
     PoolKey internal _key;
     bool public launched;
+    bool public seeded; // the factory's one liquidity add has happened
     uint64 public initBlock;
     uint64 public launchStart;
-    int24 public tickLower;
-    int24 public tickUpper;
-    uint128 public seededLiquidity;
 
     uint256 public holdersOwed; // IMD claims waiting to go to the engine
-    uint256 public burnBudget; // IMD claims waiting to buy PIMD back
     uint256 public teamOwed; // IMD claims waiting for the team
 
     uint256 public totalTaxed; // lifetime IMD taken as tax
     uint256 public totalToHolders; // lifetime IMD pushed to the engine
     uint256 public totalToTeam;
-    uint256 public totalBurnSpent; // lifetime IMD spent buying PIMD back
-    uint256 public totalBurned; // lifetime PIMD destroyed
 
     mapping(address => uint256) public launchBuys;
 
@@ -120,11 +131,13 @@ contract PimdHook is IHooks, IUnlockCallback {
 
     // ------------------------------------------------------------------ errors
     error NotPoolManager();
-    error NotLauncher();
     error AlreadyLaunched();
+    error UnsupportedFeeTier(uint24 fee);
+    error PoolMustPairToken();
+    error WrongStartingPrice(int24 got, int24 expected);
+    error LiquidityIsLocked();
     error NotLaunched();
     error HookNotImplemented();
-    error OnlyHookMayInitialize();
     error InitBlockSwap();
     error LaunchBuyCap();
     error Reentrancy();
@@ -136,10 +149,9 @@ contract PimdHook is IHooks, IUnlockCallback {
     error NoRawEth();
 
     // ------------------------------------------------------------------ events
-    event Launched(PoolId indexed id, uint128 liquidity, uint256 seeded);
+    event Launched(PoolId indexed id, int24 tick);
     event FeeTaken(bool indexed buy, uint256 fee);
-    event Flushed(address indexed caller, uint256 toHolders, uint256 toTeam, uint256 burnSpent, uint256 burned);
-    event PayoutsPushed(uint256 toHolders, uint256 toTeam);
+    event Flushed(address indexed caller, uint256 toHolders, uint256 toTeam, uint256 tip);
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -153,33 +165,22 @@ contract PimdHook is IHooks, IUnlockCallback {
         _lock = 1;
     }
 
-    constructor(IPoolManager pm, address quote_, address engine_, address team_, address launcher_, Config memory c) {
-        if (quote_ == address(0) || engine_ == address(0) || team_ == address(0) || launcher_ == address(0)) {
-            revert BadConfig();
-        }
-        if (c.burnCap == 0) revert BadConfig();
+    /// @param pm the pool manager, passed by the launch factory as $poolManager
+    /// @param token_ the PIMD token, passed by the launch factory as $token
+    constructor(IPoolManager pm, address token_) {
+        if (address(pm) == address(0) || token_ == address(0)) revert BadConfig();
         poolManager = pm;
-        quote = Currency.wrap(quote_);
-        quoteId = uint256(uint160(quote_));
-        engine = engine_;
-        team = team_;
-        launcher = launcher_;
-        launchCapSeconds = c.launchCapSeconds;
-        launchCapBlocks = c.launchCapBlocks;
-        launchBuyCap = c.launchBuyCap;
-        burnThreshold = c.burnThreshold;
-        burnCap = c.burnCap;
-        callerTip = c.callerTip;
+        token = IPimdToken(token_);
         Hooks.validateHookPermissions(this, getHookPermissions());
     }
 
     function getHookPermissions() public pure returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
-            beforeInitialize: true, // nobody but this hook may open a pool with it
+            beforeInitialize: true, // the pool must pair PIMD with IMD, at the briefed price
             afterInitialize: true,
-            beforeAddLiquidity: true, // third-party liquidity is blocked; the hook's own seed skips it (noSelfCall)
+            beforeAddLiquidity: true, // the factory seeds once; nobody adds after that
             afterAddLiquidity: false,
-            beforeRemoveLiquidity: false,
+            beforeRemoveLiquidity: true, // a withdrawal is refused forever; a zero delta is a fee collection
             afterRemoveLiquidity: false,
             beforeSwap: true,
             afterSwap: true,
@@ -192,51 +193,42 @@ contract PimdHook is IHooks, IUnlockCallback {
         });
     }
 
-    // ------------------------------------------------------------------ launch
-    /// @notice Opens the PIMD/IMD pool and puts the whole supply into one range above the opening price.
-    /// @param token_ the PIMD token, whose entire supply must already sit on this hook
-    /// @param tickLower_ bottom of the single range
-    /// @param startTick the opening price, and the top of the range
-    /// @param tickSpacing the pool's tick spacing
-    function launch(IPimdToken token_, int24 tickLower_, int24 startTick, int24 tickSpacing) external nonReentrant {
-        if (msg.sender != launcher) revert NotLauncher();
-        if (launched || initBlock != 0) revert AlreadyLaunched();
-        if (tickLower_ >= startTick) revert BadConfig();
-        // Everything below assumes IMD is currency0 and PIMD currency1, exactly as ETH/PULSE was in v1. The
-        // deploy script mines the token's salt to make that true; refuse to launch if it somehow is not.
-        if (uint160(address(token_)) <= uint160(Currency.unwrap(quote))) revert BadCurrencyOrder();
+    // ------------------------------------------------------------------ hook callbacks
+    /// @notice The launch factory opens the pool. This is the only chance to refuse a pool that would be
+    /// wrong, so it checks everything the tax maths depends on and reverts rather than let a bad one open.
+    function beforeInitialize(address, PoolKey calldata key, uint160 sqrtPriceX96)
+        external
+        onlyPoolManager
+        returns (bytes4)
+    {
+        if (launched) revert AlreadyLaunched();
+        if (engine() == address(0) || team() == address(0)) revert BadConfig();
+        if (
+            key.fee != FEE_TIER_LAUNCH && key.fee != FEE_TIER_LOW && key.fee != FEE_TIER_MID
+                && key.fee != FEE_TIER_HIGH
+        ) revert UnsupportedFeeTier(key.fee);
 
-        token = token_;
-        _key = PoolKey({
-            currency0: quote,
-            currency1: Currency.wrap(address(token_)),
-            fee: 0,
-            tickSpacing: tickSpacing,
-            hooks: IHooks(address(this))
-        });
-        tickLower = tickLower_;
-        tickUpper = startTick;
-        poolManager.initialize(_key, TickMath.getSqrtPriceAtTick(startTick));
+        address c0 = Currency.unwrap(key.currency0);
+        address c1 = Currency.unwrap(key.currency1);
+        // Every fee calculation in this contract assumes IMD is currency0 and PIMD currency1, exactly as
+        // ETH/PULSE was in v1. We no longer mine the token's address, so refuse the other ordering instead
+        // of opening a pool whose tax would be read backwards.
+        if (c1 != address(token)) revert PoolMustPairToken();
+        if (c0 == address(token) || c0 == address(0)) revert BadCurrencyOrder();
+
+        int24 tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
+        if (tick < LAUNCH_TICK - LAUNCH_TICK_TOLERANCE || tick > LAUNCH_TICK + LAUNCH_TICK_TOLERANCE) {
+            revert WrongStartingPrice(tick, LAUNCH_TICK);
+        }
+
+        quote = key.currency0;
+        quoteId = uint256(uint160(c0));
+        _key = key;
+        launched = true;
         initBlock = uint64(L2Block.number());
         launchStart = uint64(block.timestamp);
-
-        uint256 supply = token_.balanceOf(address(this));
-        _tstore(_UNLOCK_SLOT, 1);
-        bytes memory res = poolManager.unlock(abi.encode(ACTION_SEED, supply));
-        _tstore(_UNLOCK_SLOT, 0);
-        uint256 seeded = abi.decode(res, (uint256));
-        uint256 dust = token_.balanceOf(address(this));
-        if (dust > 0) token_.burn(dust); // the range maths never takes the last wei; nobody should keep it
-        launched = true;
-        emit Launched(_key.toId(), seededLiquidity, seeded);
-    }
-
-    // ------------------------------------------------------------------ hook callbacks
-    function beforeInitialize(address sender, PoolKey calldata, uint160) external view onlyPoolManager returns (bytes4) {
-        // Our own initialize never reaches here (V4 skips hook calls when the caller is the hook itself), so
-        // anything that does get here is somebody else trying to open a second pool on this hook.
-        if (sender != address(this)) revert OnlyHookMayInitialize();
-        revert AlreadyLaunched();
+        emit Launched(key.toId(), tick);
+        return IHooks.beforeInitialize.selector;
     }
 
     function afterInitialize(address, PoolKey calldata, uint160, int24) external view onlyPoolManager returns (bytes4) {
@@ -305,12 +297,15 @@ contract PimdHook is IHooks, IUnlockCallback {
         return (IHooks.afterSwap.selector, hookDeltaUnspecified);
     }
 
+    /// @notice The factory seeds the pool once, at launch. Nobody adds liquidity to this pool after that.
     function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
-        pure
+        onlyPoolManager
         returns (bytes4)
     {
-        revert HookNotImplemented();
+        if (seeded) revert LiquidityIsLocked();
+        seeded = true;
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     function afterAddLiquidity(
@@ -324,12 +319,18 @@ contract PimdHook is IHooks, IUnlockCallback {
         revert HookNotImplemented();
     }
 
-    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+    /// @notice Liquidity can never leave this pool. V4 routes both a withdrawal and a fee collection here:
+    /// a negative delta is a withdrawal and is refused forever, from anybody, including whoever owns the
+    /// position. A zero delta is the pool's own fee being collected, which is allowed, so the fee still
+    /// reaches the wallets it is owed to.
+    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata params, bytes calldata)
         external
-        pure
+        view
+        onlyPoolManager
         returns (bytes4)
     {
-        revert HookNotImplemented();
+        if (params.liquidityDelta < 0) revert LiquidityIsLocked();
+        return IHooks.beforeRemoveLiquidity.selector;
     }
 
     function afterRemoveLiquidity(
@@ -355,95 +356,38 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// @notice Permissionless. Pushes the holders' IMD to the engine, pays the team, and if the burn budget is
     /// armed, buys PIMD off the pool with it and destroys it. The caller's tip comes out of the team's slice,
     /// never out of holders or burns.
-    function flush() external nonReentrant returns (uint256 toHolders, uint256 toTeam, uint256 spent, uint256 burned) {
+    /// @notice Permissionless. Pushes the holders' IMD to the engine and the team's to the team wallet.
+    /// It never touches the pool, so a pool that cannot be swapped against can never stop the drip. The
+    /// caller's tip comes out of the team's slice, never out of holders.
+    function flush() external nonReentrant returns (uint256 toHolders, uint256 toTeam) {
         if (!launched) revert NotLaunched();
         toHolders = holdersOwed;
         toTeam = teamOwed;
-        spent = burnBudget >= burnThreshold ? (burnBudget > burnCap ? burnCap : burnBudget) : 0;
-        if (toHolders == 0 && toTeam == 0 && spent == 0) revert NothingPending();
+        if (toHolders == 0 && toTeam == 0) revert NothingPending();
         uint256 tip = callerTip;
         if (tip > toTeam) tip = toTeam;
         holdersOwed = 0;
         teamOwed = 0;
-        burnBudget -= spent;
 
         _tstore(_UNLOCK_SLOT, 1);
-        bytes memory res = poolManager.unlock(abi.encode(ACTION_FLUSH, toHolders, toTeam - tip, spent, msg.sender, tip));
+        poolManager.unlock(abi.encode(ACTION_FLUSH, toHolders, toTeam - tip, msg.sender, tip));
         _tstore(_UNLOCK_SLOT, 0);
-        burned = abi.decode(res, (uint256));
 
-        if (burned > 0) {
-            token.burn(burned);
-            totalBurned += burned;
-            totalBurnSpent += spent;
-        }
         totalToHolders += toHolders;
         totalToTeam += toTeam;
-        emit Flushed(msg.sender, toHolders, toTeam, spent, burned);
+        emit Flushed(msg.sender, toHolders, toTeam, tip);
     }
 
-    /// @notice Permissionless, and deliberately separate: it pays holders and the team without touching the
-    /// pool, so a pool that cannot be swapped against (empty, or paused by something upstream) can never stop
-    /// the drip.
-    function flushPayouts() external nonReentrant returns (uint256 toHolders, uint256 toTeam) {
-        toHolders = holdersOwed;
-        toTeam = teamOwed;
-        if (toHolders == 0 && toTeam == 0) revert NothingPending();
-        holdersOwed = 0;
-        teamOwed = 0;
-        _tstore(_UNLOCK_SLOT, 1);
-        poolManager.unlock(abi.encode(ACTION_PAYOUTS, toHolders, toTeam));
-        _tstore(_UNLOCK_SLOT, 0);
-        totalToHolders += toHolders;
-        totalToTeam += toTeam;
-        emit PayoutsPushed(toHolders, toTeam);
-    }
-
-    // ------------------------------------------------------------------ unlock callback
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
         if (_tload(_UNLOCK_SLOT) != 1) revert NotUnlocking();
         uint8 action = abi.decode(data, (uint8));
 
-        if (action == ACTION_SEED) {
-            (, uint256 amount) = abi.decode(data, (uint8, uint256));
-            uint160 sqrtA = TickMath.getSqrtPriceAtTick(tickLower);
-            uint160 sqrtB = TickMath.getSqrtPriceAtTick(tickUpper);
-            uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(sqrtA, sqrtB, amount);
-            (BalanceDelta d,) = poolManager.modifyLiquidity(
-                _key,
-                ModifyLiquidityParams({
-                    tickLower: tickLower,
-                    tickUpper: tickUpper,
-                    liquidityDelta: int256(uint256(liquidity)),
-                    salt: 0
-                }),
-                ""
-            );
-            // A single-sided range above the opening price owes PIMD only. If it asks for IMD, the ticks are wrong.
-            if (d.amount0() != 0) revert SeedNeedsQuote();
-            uint256 owed1 = uint256(uint128(-d.amount1()));
-            poolManager.sync(_key.currency1);
-            token.transfer(address(poolManager), owed1);
-            poolManager.settle();
-            seededLiquidity = liquidity;
-            return abi.encode(owed1);
-        }
-
         if (action == ACTION_FLUSH) {
-            (, uint256 toHolders, uint256 toTeam, uint256 spend, address tipTo, uint256 tip) =
-                abi.decode(data, (uint8, uint256, uint256, uint256, address, uint256));
-            uint256 bought;
-            if (spend > 0) bought = _swapBuy(spend);
-            _payOut(engine, toHolders);
-            _payOut(team, toTeam);
+            (, uint256 toHolders, uint256 toTeam, address tipTo, uint256 tip) =
+                abi.decode(data, (uint8, uint256, uint256, address, uint256));
+            _payOut(engine(), toHolders);
+            _payOut(team(), toTeam);
             _payOut(tipTo, tip);
-            return abi.encode(bought);
-        }
-
-        if (action == ACTION_PAYOUTS) {
-            (, uint256 toHolders, uint256 toTeam) = abi.decode(data, (uint8, uint256, uint256));
-            _payOut(engine, toHolders);
-            _payOut(team, toTeam);
             return "";
         }
 
@@ -459,7 +403,7 @@ contract PimdHook is IHooks, IUnlockCallback {
         return _key.toId();
     }
 
-    /// @notice IMD claims this hook holds inside the PoolManager. Equals holdersOwed + burnBudget + teamOwed.
+    /// @notice IMD claims this hook holds inside the PoolManager. Equals holdersOwed + teamOwed.
     function claimBalance() external view returns (uint256) {
         return poolManager.balanceOf(address(this), quoteId);
     }
@@ -468,9 +412,7 @@ contract PimdHook is IHooks, IUnlockCallback {
         return buy ? BUY_TAX_BPS : SELL_TAX_BPS;
     }
 
-    function burnReady() external view returns (bool) {
-        return launched && burnBudget >= burnThreshold;
-    }
+
 
     function inLaunchCapWindow() external view returns (bool) {
         return launchBuyCap > 0 && initBlock != 0 && L2Block.number() < uint256(initBlock) + launchCapBlocks
@@ -481,10 +423,8 @@ contract PimdHook is IHooks, IUnlockCallback {
     // ------------------------------------------------------------------ internals
     function _split(uint256 fee, bool isBuy) internal {
         uint256 toHolders = fee * HOLDERS_BPS / BPS;
-        uint256 toBurn = fee * BURN_BPS / BPS;
         holdersOwed += toHolders;
-        burnBudget += toBurn;
-        teamOwed += fee - toHolders - toBurn;
+        teamOwed += fee - toHolders;
         totalTaxed += fee;
         emit FeeTaken(isBuy, fee);
     }
@@ -494,26 +434,6 @@ contract PimdHook is IHooks, IUnlockCallback {
         if (amount == 0) return;
         poolManager.burn(address(this), quoteId, amount);
         poolManager.take(quote, to, amount);
-    }
-
-    /// @dev Spends `spend` IMD claims buying PIMD off our own pool, leaving the PIMD on this hook.
-    function _swapBuy(uint256 spend) internal returns (uint256 bought) {
-        _tstore(_INSWAP_SLOT, 1);
-        BalanceDelta d = poolManager.swap(
-            _key,
-            SwapParams({
-                zeroForOne: true,
-                amountSpecified: -int256(spend),
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-            }),
-            ""
-        );
-        _tstore(_INSWAP_SLOT, 0);
-        uint256 owed0 = uint256(uint128(-d.amount0()));
-        poolManager.burn(address(this), quoteId, owed0);
-        bought = uint256(uint128(d.amount1()));
-        poolManager.take(_key.currency1, address(this), bought);
-        if (owed0 < spend) burnBudget += (spend - owed0); // anything the pool could not absorb goes back
     }
 
     function _tstore(uint256 slot, uint256 value) private {
