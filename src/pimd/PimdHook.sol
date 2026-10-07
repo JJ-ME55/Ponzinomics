@@ -87,6 +87,13 @@ contract PimdHook is IHooks, IUnlockCallback {
     address internal constant TEAM_WALLET = 0x0960E8Bd80462e3842Bb6620c7C5289A44c4559B;
     /// @dev The engine is deployed by us before the launch request goes out, and its address written here.
     address internal constant ENGINE_ADDRESS = 0x92A9ABEB52031D529AB1ae3638CA073fa12Be01d;
+    /// @dev IMD on Robinhood Chain. Every fee calculation, the ERC-6909 claim id and the engine's booking all
+    /// assume the quote is this token specifically, so the pool is refused if it is anything else.
+    address internal constant QUOTE_TOKEN = 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127;
+    /// @dev The launch factory, the only address allowed to open this pool and to seed it. PoolManager's
+    /// initialize is permissionless and this hook launches exactly once, so without this a stranger can
+    /// spend the launch on a pool of their choosing, or squat the single seed and brick the real one.
+    address internal constant LAUNCH_FACTORY = 0xA25B02A1e93903b790E6aaf7dA1b8B8d50294645;
 
     uint32 public constant launchCapSeconds = 600;
     uint32 public constant launchCapBlocks = 6_000;
@@ -109,6 +116,16 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// @notice Receives the team's slice, always in IMD. It never holds or sells PIMD.
     function team() public view virtual returns (address) {
         return TEAM_WALLET;
+    }
+
+    /// @notice The only currency this pool may be quoted in.
+    function quoteToken() public view virtual returns (address) {
+        return QUOTE_TOKEN;
+    }
+
+    /// @notice The only address that may open this pool and seed it.
+    function launchFactory() public view virtual returns (address) {
+        return LAUNCH_FACTORY;
     }
 
     // ------------------------------------------------------------------ state
@@ -136,6 +153,8 @@ contract PimdHook is IHooks, IUnlockCallback {
     error PoolMustPairToken();
     error WrongStartingPrice(int24 got, int24 expected);
     error LiquidityIsLocked();
+    error NotLaunchFactory();
+    error WrongQuoteCurrency(address got);
     error NotLaunched();
     error HookNotImplemented();
     error InitBlockSwap();
@@ -196,12 +215,15 @@ contract PimdHook is IHooks, IUnlockCallback {
     // ------------------------------------------------------------------ hook callbacks
     /// @notice The launch factory opens the pool. This is the only chance to refuse a pool that would be
     /// wrong, so it checks everything the tax maths depends on and reverts rather than let a bad one open.
-    function beforeInitialize(address, PoolKey calldata key, uint160 sqrtPriceX96)
+    function beforeInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96)
         external
         onlyPoolManager
         returns (bytes4)
     {
         if (launched) revert AlreadyLaunched();
+        // initialize is permissionless on the PoolManager and this hook launches exactly once, so anyone
+        // could otherwise spend the launch on a pool of their own choosing before the factory gets there.
+        if (sender != launchFactory()) revert NotLaunchFactory();
         if (engine() == address(0) || team() == address(0)) revert BadConfig();
         if (
             key.fee != FEE_TIER_LAUNCH && key.fee != FEE_TIER_LOW && key.fee != FEE_TIER_MID
@@ -214,7 +236,9 @@ contract PimdHook is IHooks, IUnlockCallback {
         // ETH/PULSE was in v1. We no longer mine the token's address, so refuse the other ordering instead
         // of opening a pool whose tax would be read backwards.
         if (c1 != address(token)) revert PoolMustPairToken();
-        if (c0 == address(token) || c0 == address(0)) revert BadCurrencyOrder();
+        // Not merely "something that sorts below PIMD": the tax is taken in this token, the claim id is
+        // derived from it and the engine only ever books this token, so anything else is unrecoverable.
+        if (c0 != quoteToken()) revert WrongQuoteCurrency(c0);
 
         int24 tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
         if (tick < LAUNCH_TICK - LAUNCH_TICK_TOLERANCE || tick > LAUNCH_TICK + LAUNCH_TICK_TOLERANCE) {
@@ -298,11 +322,14 @@ contract PimdHook is IHooks, IUnlockCallback {
     }
 
     /// @notice The factory seeds the pool once, at launch. Nobody adds liquidity to this pool after that.
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+    function beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4)
     {
+        // The seed belongs to the factory. Without this, a stranger adding one wei first consumes the only
+        // permitted add and the factory's real seed reverts.
+        if (sender != launchFactory()) revert NotLaunchFactory();
         if (seeded) revert LiquidityIsLocked();
         seeded = true;
         return IHooks.beforeAddLiquidity.selector;

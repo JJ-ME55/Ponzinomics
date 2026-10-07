@@ -147,6 +147,7 @@ contract PimdEngine is ReentrancyGuard {
     error AlreadyBound();
     error NotBound();
     error WrongPhase();
+    error TallyMustBeWhole(uint256 holders);
     error TooSoon();
     error BadConfig();
     error PoolUnlocked();
@@ -269,12 +270,20 @@ contract PimdEngine is ReentrancyGuard {
     }
 
     /// @notice First pass: reads each holder's PIMD balance, updates the hold streak, records this epoch's weight.
+    /// @notice Weighs every registered holder for this epoch. It must cover all of them in one call.
+    /// @dev Paging this is what let one bag be counted once per wallet it was moved through: weights are
+    /// read from live balances, so a page boundary is a window to transfer the bag and be weighed again.
+    /// With N wallets a sybil took N/(N+1) of the epoch out of the honest holders' share. Weighing the
+    /// whole set in a single call closes it, because nothing can move tokens in the middle of a loop.
+    /// `pay` stays paged: by then the weights are frozen and a transfer cannot change them.
+    /// The cost is a ceiling on holders per epoch, bounded by the block gas limit. `epochCount` and
+    /// `holderCount()` are public so the keeper can watch how close that ceiling is.
     function tally(uint256 maxHolders) external nonReentrant {
         if (phase != Phase.Tally) revert WrongPhase();
         _requireLocked();
         uint256 start = cursor;
-        uint256 end = start + maxHolders;
-        if (end > epochCount) end = epochCount;
+        if (start != 0 || maxHolders < epochCount) revert TallyMustBeWhole(epochCount);
+        uint256 end = epochCount;
         uint256 tw = totalWeight;
         uint256 nowTs = block.timestamp;
         for (uint256 i = start; i < end; ++i) {

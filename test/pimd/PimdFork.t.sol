@@ -101,10 +101,10 @@ contract PimdForkTest is Test {
         }
         require(address(token) != address(0) && uint160(address(token)) > uint160(IMD), "token order");
 
-        bytes memory args = abi.encode(manager, address(token), address(engine), team);
+        bytes memory args = abi.encode(manager, address(token), address(engine), team, IMD, address(this));
         (address hookAddr, bytes32 hookSalt) =
             HookMiner.find(address(this), FLAGS, type(PimdHookHarness).creationCode, args);
-        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team))));
+        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team, IMD, address(this)))));
         require(address(hook) == hookAddr, "hook addr");
 
         // Open and seed the pool the way the factory will: from outside, through the PoolManager.

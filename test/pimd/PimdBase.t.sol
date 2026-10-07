@@ -12,6 +12,8 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {ERC20} from "solmate/src/tokens/ERC20.sol";
 import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
@@ -31,13 +33,75 @@ contract MockIMD is ERC20("Identity.md", "IMD", 18) {
 
 /// The production hook writes the engine and the team wallet into its source. This points them at the
 /// doubles a test deploys, and changes nothing else: every other line executed is the real contract's.
+/// Stands in for the IMD launch factory: one address that opens the pool and makes the single seeding
+/// add, which is what the hook now insists on. Production does both from the factory contract too, so
+/// this is closer to the real flow than driving the add through a test router.
+contract MockLaunchFactory is IUnlockCallback {
+    IPoolManager public immutable manager;
+
+    constructor(IPoolManager m) {
+        manager = m;
+    }
+
+    function open(PoolKey memory key, uint160 sqrtPriceX96) external {
+        manager.initialize(key, sqrtPriceX96);
+    }
+
+    function seed(PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity) external {
+        manager.unlock(abi.encode(key, tickLower, tickUpper, liquidity));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "only manager");
+        (PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity) =
+            abi.decode(data, (PoolKey, int24, int24, uint128));
+        (BalanceDelta d,) = manager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: int256(uint256(liquidity)),
+                salt: 0
+            }),
+            ""
+        );
+        // Settle whatever is owed and take whatever is due, so the same path serves both the seeding add
+        // and a zero-delta fee collection.
+        if (d.amount1() < 0) {
+            manager.sync(key.currency1);
+            IERC20Like(Currency.unwrap(key.currency1)).transfer(address(manager), uint256(uint128(-d.amount1())));
+            manager.settle();
+        } else if (d.amount1() > 0) {
+            manager.take(key.currency1, address(this), uint256(uint128(d.amount1())));
+        }
+        if (d.amount0() < 0) {
+            manager.sync(key.currency0);
+            IERC20Like(Currency.unwrap(key.currency0)).transfer(address(manager), uint256(uint128(-d.amount0())));
+            manager.settle();
+        } else if (d.amount0() > 0) {
+            manager.take(key.currency0, address(this), uint256(uint128(d.amount0())));
+        }
+        return "";
+    }
+}
+
+interface IERC20Like {
+    function transfer(address, uint256) external returns (bool);
+}
+
 contract PimdHookHarness is PimdHook {
     address private immutable _engine;
     address private immutable _team;
+    address private immutable _quote;
+    address private immutable _factory;
 
-    constructor(IPoolManager pm, address token_, address engine_, address team_) PimdHook(pm, token_) {
+    constructor(IPoolManager pm, address token_, address engine_, address team_, address quote_, address factory_)
+        PimdHook(pm, token_)
+    {
         _engine = engine_;
         _team = team_;
+        _quote = quote_;
+        _factory = factory_;
     }
 
     function engine() public view override returns (address) {
@@ -46,6 +110,14 @@ contract PimdHookHarness is PimdHook {
 
     function team() public view override returns (address) {
         return _team;
+    }
+
+    function quoteToken() public view override returns (address) {
+        return _quote;
+    }
+
+    function launchFactory() public view override returns (address) {
+        return _factory;
     }
 }
 
@@ -85,6 +157,7 @@ abstract contract PimdBaseTest is Test {
     IPoolManager manager;
     PoolSwapTest router;
     PoolModifyLiquidityTest lpRouter;
+    MockLaunchFactory factory;
     MockIMD imd;
     PimdToken token;
     PimdHook hook;
@@ -108,6 +181,7 @@ abstract contract PimdBaseTest is Test {
         manager = IPoolManager(address(new PoolManager(address(this))));
         router = new PoolSwapTest(manager);
         lpRouter = new PoolModifyLiquidityTest(manager);
+        factory = new MockLaunchFactory(manager);
         imd = new MockIMD();
 
         engine = new PimdEngine(
@@ -129,10 +203,10 @@ abstract contract PimdBaseTest is Test {
         // argument. Its salt is still mined so PIMD sorts above IMD: the hook refuses the other ordering.
         token = PimdToken(_deployTokenAbove(address(imd)));
 
-        bytes memory args = abi.encode(manager, address(token), address(engine), team);
+        bytes memory args = abi.encode(manager, address(token), address(engine), team, address(imd), address(factory));
         (address hookAddr, bytes32 hookSalt) =
             HookMiner.find(address(this), HOOK_FLAGS, type(PimdHookHarness).creationCode, args);
-        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team))));
+        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team, address(imd), address(factory)))));
         require(address(hook) == hookAddr, "hook addr");
 
         _openPoolAsFactory();
@@ -152,24 +226,14 @@ abstract contract PimdBaseTest is Test {
             tickSpacing: SPACING,
             hooks: IHooks(address(hook))
         });
-        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+        factory.open(k, TickMath.getSqrtPriceAtTick(START_TICK));
 
         uint256 amount = token.balanceOf(address(this)) * 9 / 10; // the policy seeds 90% of our share
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
             TickMath.getSqrtPriceAtTick(TICK_LOWER), TickMath.getSqrtPriceAtTick(START_TICK), amount
         );
-        token.approve(address(lpRouter), type(uint256).max);
-        imd.approve(address(lpRouter), type(uint256).max);
-        lpRouter.modifyLiquidity(
-            k,
-            ModifyLiquidityParams({
-                tickLower: TICK_LOWER,
-                tickUpper: START_TICK,
-                liquidityDelta: int256(uint256(liquidity)),
-                salt: 0
-            }),
-            ""
-        );
+        token.transfer(address(factory), amount); // the factory holds the supply it seeds, as in production
+        factory.seed(k, TICK_LOWER, START_TICK, liquidity);
     }
 
     /// Mines a CREATE2 salt so the token's address sorts above IMD, which is what keeps IMD as currency0.

@@ -284,6 +284,7 @@ contract PimdTest is PimdBaseTest {
         PoolKey memory k =
             PoolKey({currency0: c0, currency1: c1, fee: 12_500, tickSpacing: SPACING, hooks: IHooks(address(fresh))});
         vm.expectRevert();
+        vm.prank(address(factory));
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
     }
 
@@ -291,6 +292,7 @@ contract PimdTest is PimdBaseTest {
         (PimdHook fresh, PimdToken t) = _freshHook();
         PoolKey memory k = _keyFor(fresh, t, 4000);
         vm.expectRevert();
+        vm.prank(address(factory));
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
     }
 
@@ -299,17 +301,64 @@ contract PimdTest is PimdBaseTest {
         PoolKey memory k = _keyFor(fresh, t, 12_500);
         // a thousand ticks away from the briefed opening, far outside the tolerance
         vm.expectRevert();
+        vm.prank(address(factory));
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK + 1000));
     }
 
     function test_initialize_accepts_a_price_inside_the_tolerance() public {
         (PimdHook fresh, PimdToken t) = _freshHook();
         PoolKey memory k = _keyFor(fresh, t, 12_500);
+        vm.prank(address(factory));
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK - 120));
         assertTrue(fresh.launched(), "a near-enough price opens");
     }
 
+    /// Audit finding, HIGH: initialize is permissionless on the PoolManager and this hook launches once,
+    /// so anyone could spend the launch on a pool of their choosing before the factory got there.
+    function test_only_the_launch_factory_may_open_the_pool() public {
+        (PimdHook fresh, PimdToken t) = _freshHook();
+        PoolKey memory k = _keyFor(fresh, t, 12_500);
+        vm.prank(alice); // not the factory
+        vm.expectRevert();
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+    }
+
+    /// Audit finding, HIGH: the hook checked only that currency0 sorted below PIMD, never that it was IMD.
+    /// Every fee calculation, the claim id and the engine's booking assume that one token specifically.
+    function test_initialize_refuses_a_quote_that_is_not_imd() public {
+        (PimdHook fresh, PimdToken t) = _freshHook();
+        MockIMD junk = new MockIMD();
+        vm.assume(uint160(address(junk)) < uint160(address(t)));
+        PoolKey memory k = PoolKey({
+            currency0: Currency.wrap(address(junk)),
+            currency1: Currency.wrap(address(t)),
+            fee: 12_500,
+            tickSpacing: SPACING,
+            hooks: IHooks(address(fresh))
+        });
+        vm.prank(address(factory));
+        vm.expectRevert();
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+    }
+
     // ------------------------------------------------------------------ the liquidity lock
+    /// Audit finding, MEDIUM, found by three specialists: the single permitted add went to whoever was
+    /// first, so one wei from a stranger consumed it and the factory's real seed reverted.
+    function test_a_stranger_cannot_squat_the_seed() public {
+        (PimdHook fresh, PimdToken t) = _freshHook();
+        PoolKey memory k = _keyFor(fresh, t, 12_500);
+        vm.prank(address(factory));
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+        assertFalse(fresh.seeded(), "not seeded yet");
+        vm.expectRevert();
+        lpRouter.modifyLiquidity(
+            k,
+            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: 1, salt: 0}),
+            ""
+        );
+        assertFalse(fresh.seeded(), "the seed slot is still the factory's");
+    }
+
     function test_a_second_liquidity_add_is_refused() public {
         vm.expectRevert();
         lpRouter.modifyLiquidity(
@@ -334,11 +383,7 @@ contract PimdTest is PimdBaseTest {
     function test_fee_collection_is_still_allowed() public {
         _pastLaunchCap();
         _buy(alice, 10e18);
-        lpRouter.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: 0, salt: 0}),
-            ""
-        );
+        factory.seed(key, TICK_LOWER, START_TICK, 0); // zero delta: a fee collection, not a withdrawal
     }
 
     function test_bind_is_one_shot() public {
@@ -364,9 +409,9 @@ contract PimdTest is PimdBaseTest {
             }
         }
         require(address(t) != address(0), "no salt");
-        bytes memory args = abi.encode(manager, address(t), address(engine), team);
+        bytes memory args = abi.encode(manager, address(t), address(engine), team, address(imd), address(factory));
         (, bytes32 salt2) = HookMiner.find(address(this), HOOK_FLAGS, type(PimdHookHarness).creationCode, args);
-        fresh = PimdHook(payable(address(new PimdHookHarness{salt: salt2}(manager, address(t), address(engine), team))));
+        fresh = PimdHook(payable(address(new PimdHookHarness{salt: salt2}(manager, address(t), address(engine), team, address(imd), address(factory)))));
     }
 
     function _keyFor(PimdHook h, PimdToken t, uint24 fee) internal view returns (PoolKey memory) {

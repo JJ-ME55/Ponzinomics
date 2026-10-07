@@ -113,7 +113,7 @@ contract PimdAttacksTest is PimdBaseTest {
     }
 
     // ------------------------------------------------------------------ paging
-    function test_many_holders_pay_out_across_pages() public {
+    function test_many_holders_weigh_whole_and_pay_across_pages() public {
         _pastLaunchCap();
         uint256 n = 120;
         address[] memory list = new address[](n);
@@ -127,10 +127,12 @@ contract PimdAttacksTest is PimdBaseTest {
 
         vm.startPrank(keeper);
         engine.fire();
+        // Weighing is whole or nothing: a page boundary is the window a sybil moves a bag through.
+        vm.expectRevert(abi.encodeWithSelector(PimdEngine.TallyMustBeWhole.selector, n));
         engine.tally(50);
-        engine.tally(50);
-        engine.tally(50); // past the end: clamps
-        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Pay), "tallied in pages");
+        engine.tally(n);
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Pay), "weighed in one call");
+        // Paying is still paged: the weights are frozen, so nothing a payee does can change them.
         engine.pay(50);
         engine.pay(50);
         engine.pay(50);
@@ -142,6 +144,55 @@ contract PimdAttacksTest is PimdBaseTest {
             if (imd.balanceOf(list[i]) > 0) ++paidCount;
         }
         assertEq(paidCount, n, "every holder got IMD");
+    }
+
+    /// Audit finding, HIGH, found independently by two specialists: tally read live balances per page, so
+    /// moving one bag between pages had it weighed once per wallet it passed through. With N wallets a
+    /// sybil took N/(N+1) of every epoch out of the honest holders' share.
+    function test_one_bag_cannot_be_weighed_twice_across_wallets() public {
+        _pastLaunchCap();
+        _buy(alice, 400e18);
+        uint256 bag = token.balanceOf(alice) / 2;
+        vm.prank(alice);
+        token.transfer(carol, bag); // identical bags, so an honest pair would be paid identically
+
+        // register alice and carol honestly, then let bob register on the strength of alice's bag and
+        // hand it straight back: three registered wallets, two bags between them
+        address[] memory two = new address[](2);
+        (two[0], two[1]) = (alice, carol);
+        engine.register(two);
+        vm.prank(alice);
+        token.transfer(bob, bag);
+        address[] memory one = new address[](1);
+        one[0] = bob;
+        engine.register(one);
+        vm.prank(bob);
+        token.transfer(alice, bag);
+        assertEq(engine.holderCount(), 3, "three wallets registered on two bags");
+
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(keeper);
+        engine.fire();
+
+        // the attack needed a page boundary to move the bag through. There is no longer one.
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(PimdEngine.TallyMustBeWhole.selector, 3));
+        engine.tally(2);
+
+        vm.startPrank(keeper);
+        engine.tally(3);
+        engine.pay(10);
+        vm.stopPrank();
+
+        uint256 honest = imd.balanceOf(carol);
+        assertGt(honest, 0, "carol was paid");
+        assertEq(imd.balanceOf(bob), 0, "the empty sybil wallet earns nothing");
+        assertApproxEqRel(
+            imd.balanceOf(alice) + imd.balanceOf(bob),
+            honest,
+            0.01e18,
+            "one bag earns one share, however many wallets it was registered through"
+        );
     }
 
     // ------------------------------------------------------------------ rogue pools and dust
