@@ -17,6 +17,7 @@ import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {PimdToken} from "../../src/pimd/PimdToken.sol";
 import {PimdHook, IPimdToken} from "../../src/pimd/PimdHook.sol";
 import {PimdEngine} from "../../src/pimd/PimdEngine.sol";
+import {L2Block} from "../../src/libraries/L2Block.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PimdHookHarness} from "./PimdBase.t.sol";
 
@@ -134,10 +135,16 @@ contract PimdForkTest is Test {
         engine.bind(address(token), address(hook));
         key = hook.poolKey();
 
-        vm.roll(block.number + 1); // past the init block
+        // Nothing here advances the block: a roll or an etch done in setUp does not reach the test body
+        // on this Foundry version, so the trading helpers below do it themselves.
     }
 
     // ------------------------------------------------------------------ helpers
+    /// Makes L2Block.number() report `n`, which vm.roll cannot do on an Orbit fork.
+    function _l2Block(uint256 n) internal {
+        vm.mockCall(address(100), abi.encodeWithSignature("arbBlockNumber()"), abi.encode(n));
+    }
+
     function _fundImd(address who, uint256 amount) internal {
         deal(IMD, who, amount);
         assertGe(imd.balanceOf(who), amount, "real IMD could not be dealt; find a whale instead");
@@ -146,6 +153,10 @@ contract PimdForkTest is Test {
     }
 
     function _buy(address who, uint256 amount) internal returns (uint256 got) {
+        // On a fork of this chain ArbSys answers for real, so L2Block reads the live L2 block and vm.roll,
+        // which only moves the L1 block, does nothing to it. Mock ArbSys instead, past the init block and
+        // past the launch cap window.
+        _l2Block(uint256(hook.initBlock()) + hook.launchCapBlocks() + 1);
         _fundImd(who, amount);
         uint256 before = token.balanceOf(who);
         vm.prank(who, who);

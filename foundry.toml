@@ -1,5 +1,7 @@
 [profile.default]
 src = "src"
+test = "test"
+script = "script"
 out = "out"
 libs = ["lib"]
 solc = "0.8.26"
@@ -9,8 +11,8 @@ optimizer_runs = 44444444
 via_ir = true
 # A launch compares deployed bytes against a local build, so the metadata hash must not be in them.
 bytecode_hash = "none"
-fs_permissions = [{ access = "read-write", path = "./" }]
-ffi = false
+# No fs_permissions and no ffi: the launch sandbox refuses to run a build whose config reaches outside
+# the build output, and nothing here needs either.
 
 remappings = [
   "forge-std/=lib/forge-std/src/",
