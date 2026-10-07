@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {PimdBaseTest} from "./PimdBase.t.sol";
+import {PimdBaseTest, PimdHookHarness, MockIMD} from "./PimdBase.t.sol";
+import {PimdToken} from "../../src/pimd/PimdToken.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {PimdEngine} from "../../src/pimd/PimdEngine.sol";
 import {PimdHook, IPimdToken} from "../../src/pimd/PimdHook.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -17,13 +20,13 @@ contract PimdTest is PimdBaseTest {
     using StateLibrary for IPoolManager;
 
     // ------------------------------------------------------------------ launch
-    function test_launch_puts_every_token_in_one_range() public view {
+    function test_launch_puts_the_seed_in_one_range() public view {
         assertTrue(hook.launched(), "launched");
-        assertEq(token.balanceOf(address(hook)), 0, "hook keeps nothing");
-        // all of it is in the PoolManager, minus whatever dust the range maths burned
-        assertEq(token.balanceOf(address(manager)), token.totalSupply(), "supply is the position");
-        assertGt(hook.seededLiquidity(), 0, "liquidity");
-        assertLt(SUPPLY - token.totalSupply(), SUPPLY / 1_000_000, "dust is tiny");
+        assertTrue(hook.seeded(), "seeded");
+        assertEq(token.balanceOf(address(hook)), 0, "the hook never holds PIMD");
+        // the policy seeds ninety percent of our share single-sided; nothing of it is IMD
+        assertGt(token.balanceOf(address(manager)), SUPPLY * 85 / 100, "most of the supply is the position");
+        assertEq(token.totalSupply(), SUPPLY, "supply is fixed and never moves");
     }
 
     function test_launch_sets_imd_as_currency0() public view {
@@ -37,20 +40,20 @@ contract PimdTest is PimdBaseTest {
     }
 
     // ------------------------------------------------------------------ the tax
-    function test_buy_pays_three_percent_in_imd() public {
+    function test_buy_pays_the_buy_tax_in_imd() public {
         _pastInit();
         uint256 spend = 10e18;
         uint256 got = _buy(alice, spend);
         assertGt(got, 0, "received PIMD");
 
-        uint256 expectedFee = spend * 300 / BPS;
-        assertEq(hook.totalTaxed(), expectedFee, "3% of the IMD going in");
+        uint256 expectedFee = spend * 240 / BPS;
+        assertEq(hook.totalTaxed(), expectedFee, "the buy tax, of the IMD going in");
         assertEq(hook.claimBalance(), expectedFee, "held as IMD claims");
         assertEq(imd.balanceOf(address(manager)), spend, "all the IMD is in the manager");
     }
 
-    function test_sell_pays_seven_percent_in_imd() public {
-        _pastInit();
+    function test_sell_pays_the_sell_tax_in_imd() public {
+        _pastLaunchCap();
         _buy(alice, 50e18);
         uint256 taxedOnBuy = hook.totalTaxed();
 
@@ -60,38 +63,45 @@ contract PimdTest is PimdBaseTest {
 
         uint256 sellFee = hook.totalTaxed() - taxedOnBuy;
         // the seller receives the output net of 7%
-        assertApproxEqRel(sellFee, got * 700 / 9300, 1e12, "7% of the IMD coming out");
+        assertApproxEqRel(sellFee, got * 560 / 9440, 1e12, "the sell tax, of the IMD coming out");
     }
 
     function test_exact_out_buy_is_taxed_too() public {
-        _pastInit();
+        _pastLaunchCap();
         _buy(alice, 20e18); // put some IMD in the pool first
         uint256 before = hook.totalTaxed();
         uint256 spent = _buyExactOut(bob, 1_000_000e18, 100e18);
         uint256 fee = hook.totalTaxed() - before;
         assertGt(fee, 0, "exact-out buys pay too");
-        assertApproxEqRel(fee, spent * 300 / BPS, 1e12, "3% of what was spent");
+        assertApproxEqRel(fee, spent * 240 / BPS, 1e12, "the buy tax, of what was spent");
     }
 
     function test_exact_out_sell_is_taxed_too() public {
-        _pastInit();
+        _pastLaunchCap();
         _buy(alice, 50e18);
         uint256 before = hook.totalTaxed();
         uint256 want = 1e18;
         _sellExactOut(alice, want);
         uint256 fee = hook.totalTaxed() - before;
-        assertApproxEqRel(fee, want * 700 / 9300, 1e12, "7% on top of what was asked for");
+        assertApproxEqRel(fee, want * 560 / 9440, 1e12, "the sell tax, on top of what was asked for");
     }
 
     // ------------------------------------------------------------------ the split
-    function test_tax_splits_sixty_twenty_twenty() public {
+    function test_tax_splits_seventy_five_twenty_five() public {
         _pastLaunchCap();
         _buy(alice, 100e18);
         uint256 fee = hook.totalTaxed();
-        assertEq(hook.holdersOwed(), fee * 6000 / BPS, "60% holders");
-        assertEq(hook.burnBudget(), fee * 2000 / BPS, "20% burn");
-        assertEq(hook.teamOwed(), fee - (fee * 6000 / BPS) - (fee * 2000 / BPS), "20% team");
-        assertEq(hook.holdersOwed() + hook.burnBudget() + hook.teamOwed(), hook.claimBalance(), "ledger = claims");
+        assertEq(hook.holdersOwed(), fee * 7500 / BPS, "75% holders");
+        assertEq(hook.teamOwed(), fee - (fee * 7500 / BPS), "25% team");
+        assertEq(hook.holdersOwed() + hook.teamOwed(), hook.claimBalance(), "ledger = claims");
+    }
+
+    /// The burn takes nothing from the tax any more: it is funded by the pool's own fee, outside the hook.
+    function test_the_tax_is_only_holders_and_team() public {
+        _pastLaunchCap();
+        _buy(alice, 100e18);
+        assertEq(hook.HOLDERS_BPS() + 2500, hook.BPS(), "the split is exhaustive");
+        assertEq(hook.holdersOwed() + hook.teamOwed(), hook.totalTaxed(), "nothing is held back");
     }
 
     function test_flush_payouts_moves_real_imd() public {
@@ -101,29 +111,12 @@ contract PimdTest is PimdBaseTest {
         uint256 teamOwed = hook.teamOwed();
 
         vm.prank(keeper);
-        hook.flushPayouts();
+        hook.flush();
 
         assertEq(imd.balanceOf(address(engine)), owed, "engine holds the holders' IMD");
-        assertEq(imd.balanceOf(team), teamOwed, "team paid");
+        assertEq(imd.balanceOf(team), teamOwed - hook.callerTip(), "team paid, less the caller's tip");
         assertEq(hook.holdersOwed(), 0, "cleared");
-        assertEq(hook.claimBalance(), hook.burnBudget(), "only the burn budget is left");
-    }
-
-    function test_flush_buys_pimd_back_and_burns_it() public {
-        _pastLaunchCap();
-        _buy(alice, 500e18); // big enough to arm the burn budget
-        assertTrue(hook.burnReady(), "armed");
-        uint256 supplyBefore = token.totalSupply();
-        uint256 budget = hook.burnBudget();
-
-        vm.prank(keeper);
-        (,, uint256 spent, uint256 burned) = hook.flush();
-
-        assertGt(burned, 0, "something was burned");
-        assertEq(spent, budget > cfg.burnCap ? cfg.burnCap : budget, "spent the armed budget");
-        assertEq(token.totalSupply(), supplyBefore - burned, "supply actually fell");
-        assertEq(token.balanceOf(address(hook)), 0, "the hook keeps no PIMD");
-        assertEq(hook.totalBurned(), burned, "counter");
+        assertEq(hook.claimBalance(), 0, "nothing left behind");
     }
 
     function test_keeper_tip_comes_out_of_the_team_slice() public {
@@ -135,8 +128,8 @@ contract PimdTest is PimdBaseTest {
         vm.prank(keeper);
         hook.flush();
 
-        assertEq(imd.balanceOf(keeper), cfg.callerTip, "keeper tipped");
-        assertEq(imd.balanceOf(team), teamOwed - cfg.callerTip, "out of the team's share");
+        assertEq(imd.balanceOf(keeper), hook.callerTip(), "keeper tipped");
+        assertEq(imd.balanceOf(team), teamOwed - hook.callerTip(), "out of the team's share");
         assertEq(imd.balanceOf(address(engine)), holders, "holders untouched");
     }
 
@@ -222,7 +215,7 @@ contract PimdTest is PimdBaseTest {
         _buy(bob, 200e18);
         uint256 drippedBefore = engine.totalDripped();
         vm.prank(keeper);
-        hook.flushPayouts();
+        hook.flush();
         vm.warp(block.timestamp + 15 minutes);
         uint256 potBefore = imd.balanceOf(address(engine)); // what fire() will book as the pot
         _runEpoch();
@@ -248,7 +241,7 @@ contract PimdTest is PimdBaseTest {
 
     function test_launch_cap_limits_one_buyer() public {
         _pastInit();
-        _buy(alice, cfg.launchBuyCap - 1e18);
+        _buy(alice, hook.launchBuyCap() - 1e18);
         _fund(alice, 10e18);
         vm.expectRevert();
         vm.prank(alice, alice);
@@ -262,14 +255,15 @@ contract PimdTest is PimdBaseTest {
 
     function test_launch_cap_expires() public {
         _pastInit();
-        _buy(alice, cfg.launchBuyCap - 1e18);
+        _buy(alice, hook.launchBuyCap() - 1e18);
         _pastLaunchCap();
         assertFalse(hook.inLaunchCapWindow(), "window closed");
         uint256 got = _buy(alice, 100e18); // way over the old cap
         assertGt(got, 0, "no cap any more");
     }
 
-    function test_nobody_else_can_launch_a_pool_on_this_hook() public {
+    // ------------------------------------------------------------------ the initialize gate
+    function test_a_second_pool_on_this_hook_is_refused() public {
         PoolKey memory other = PoolKey({
             currency0: key.currency0,
             currency1: key.currency1,
@@ -278,12 +272,73 @@ contract PimdTest is PimdBaseTest {
             hooks: key.hooks
         });
         vm.expectRevert();
-        manager.initialize(other, 79228162514264337593543950336);
+        manager.initialize(other, TickMath.getSqrtPriceAtTick(START_TICK));
     }
 
-    function test_second_launch_is_refused() public {
-        vm.expectRevert(PimdHook.AlreadyLaunched.selector);
-        hook.launch(IPimdToken(address(token)), TICK_LOWER, START_TICK, SPACING);
+    function test_initialize_refuses_a_pool_that_is_not_our_token() public {
+        (PimdHook fresh,) = _freshHook();
+        MockIMD other = new MockIMD();
+        (Currency c0, Currency c1) = uint160(address(other)) < uint160(address(imd))
+            ? (Currency.wrap(address(other)), Currency.wrap(address(imd)))
+            : (Currency.wrap(address(imd)), Currency.wrap(address(other)));
+        PoolKey memory k =
+            PoolKey({currency0: c0, currency1: c1, fee: 12_500, tickSpacing: SPACING, hooks: IHooks(address(fresh))});
+        vm.expectRevert();
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+    }
+
+    function test_initialize_refuses_an_unsupported_fee_tier() public {
+        (PimdHook fresh, PimdToken t) = _freshHook();
+        PoolKey memory k = _keyFor(fresh, t, 4000);
+        vm.expectRevert();
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+    }
+
+    function test_initialize_refuses_a_mispriced_pool() public {
+        (PimdHook fresh, PimdToken t) = _freshHook();
+        PoolKey memory k = _keyFor(fresh, t, 12_500);
+        // a thousand ticks away from the briefed opening, far outside the tolerance
+        vm.expectRevert();
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK + 1000));
+    }
+
+    function test_initialize_accepts_a_price_inside_the_tolerance() public {
+        (PimdHook fresh, PimdToken t) = _freshHook();
+        PoolKey memory k = _keyFor(fresh, t, 12_500);
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK - 120));
+        assertTrue(fresh.launched(), "a near-enough price opens");
+    }
+
+    // ------------------------------------------------------------------ the liquidity lock
+    function test_a_second_liquidity_add_is_refused() public {
+        vm.expectRevert();
+        lpRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: 1e18, salt: 0}),
+            ""
+        );
+    }
+
+    /// The whole reason the launch factory can hold the position safely: it can never move it.
+    function test_liquidity_can_never_be_removed() public {
+        vm.expectRevert();
+        lpRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: -1, salt: 0}),
+            ""
+        );
+    }
+
+    /// A zero delta is a fee collection, not a withdrawal, and has to keep working or the pool's own fee
+    /// would be stranded forever.
+    function test_fee_collection_is_still_allowed() public {
+        _pastLaunchCap();
+        _buy(alice, 10e18);
+        lpRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: 0, salt: 0}),
+            ""
+        );
     }
 
     function test_bind_is_one_shot() public {
@@ -298,6 +353,32 @@ contract PimdTest is PimdBaseTest {
     }
 
     // ------------------------------------------------------------------ helpers
+    /// A hook and token that have never been launched, for testing the gate itself.
+    function _freshHook() internal returns (PimdHook fresh, PimdToken t) {
+        bytes32 initHash = keccak256(type(PimdToken).creationCode);
+        for (uint256 i = 500_000; i < 600_000; ++i) {
+            address predicted = vm.computeCreate2Address(bytes32(i), initHash, address(this));
+            if (uint160(predicted) > uint160(address(imd))) {
+                t = new PimdToken{salt: bytes32(i)}();
+                break;
+            }
+        }
+        require(address(t) != address(0), "no salt");
+        bytes memory args = abi.encode(manager, address(t), address(engine), team);
+        (, bytes32 salt2) = HookMiner.find(address(this), HOOK_FLAGS, type(PimdHookHarness).creationCode, args);
+        fresh = PimdHook(payable(address(new PimdHookHarness{salt: salt2}(manager, address(t), address(engine), team))));
+    }
+
+    function _keyFor(PimdHook h, PimdToken t, uint24 fee) internal view returns (PoolKey memory) {
+        return PoolKey({
+            currency0: Currency.wrap(address(imd)),
+            currency1: Currency.wrap(address(t)),
+            fee: fee,
+            tickSpacing: SPACING,
+            hooks: IHooks(address(h))
+        });
+    }
+
     function _exactIn(uint256 amount) internal pure returns (SwapParams memory) {
         return SwapParams({
             zeroForOne: true,

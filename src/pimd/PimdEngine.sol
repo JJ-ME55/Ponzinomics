@@ -13,7 +13,7 @@ interface IERC20Min {
 }
 
 interface IPimdHookLike {
-    function flushPayouts() external returns (uint256, uint256);
+    function flush() external returns (uint256, uint256);
     function holdersOwed() external view returns (uint256);
 }
 
@@ -244,7 +244,7 @@ contract PimdEngine is ReentrancyGuard {
 
         // Best effort: a hook-side problem may delay income but must never block a drip.
         if (hook.holdersOwed() != 0) {
-            try hook.flushPayouts() {} catch {}
+            try hook.flush() {} catch {}
         }
         _book();
 

@@ -12,7 +12,11 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {ERC20} from "solmate/src/tokens/ERC20.sol";
+import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {PimdToken} from "../../src/pimd/PimdToken.sol";
 import {PimdHook, IPimdToken} from "../../src/pimd/PimdHook.sol";
@@ -22,6 +26,26 @@ import {PimdEngine} from "../../src/pimd/PimdEngine.sol";
 contract MockIMD is ERC20("Identity.md", "IMD", 18) {
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
+    }
+}
+
+/// The production hook writes the engine and the team wallet into its source. This points them at the
+/// doubles a test deploys, and changes nothing else: every other line executed is the real contract's.
+contract PimdHookHarness is PimdHook {
+    address private immutable _engine;
+    address private immutable _team;
+
+    constructor(IPoolManager pm, address token_, address engine_, address team_) PimdHook(pm, token_) {
+        _engine = engine_;
+        _team = team_;
+    }
+
+    function engine() public view override returns (address) {
+        return _engine;
+    }
+
+    function team() public view override returns (address) {
+        return _team;
     }
 }
 
@@ -47,17 +71,20 @@ abstract contract PimdBaseTest is Test {
     uint160 constant HOOK_FLAGS = uint160(
         Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
             | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
+            | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
     );
     uint256 constant SUPPLY = 1_000_000_000e18;
     uint256 constant BPS = 10_000;
-    /// ~2.37M PIMD per IMD: a one billion supply opening around five thousand dollars with IMD near $12.
-    int24 constant START_TICK = 146760;
-    int24 constant TICK_LOWER = 100740; // ~100x of range below the open
+    /// The tick the launch policy's 2,500 IMD opening cap implies on a one billion supply, which is what
+    /// the hook refuses to open outside of.
+    int24 constant START_TICK = 129000;
+    int24 constant TICK_LOWER = 82980; // ~100x of range below the open
     int24 constant SPACING = 60;
     address constant ARBSYS = address(100);
 
     IPoolManager manager;
     PoolSwapTest router;
+    PoolModifyLiquidityTest lpRouter;
     MockIMD imd;
     PimdToken token;
     PimdHook hook;
@@ -72,7 +99,6 @@ abstract contract PimdBaseTest is Test {
     address keeper = makeAddr("keeper");
 
     MockArbSys sys;
-    PimdHook.Config cfg;
 
     function setUp() public virtual {
         vm.etch(ARBSYS, address(new MockArbSys()).code);
@@ -81,6 +107,7 @@ abstract contract PimdBaseTest is Test {
 
         manager = IPoolManager(address(new PoolManager(address(this))));
         router = new PoolSwapTest(manager);
+        lpRouter = new PoolModifyLiquidityTest(manager);
         imd = new MockIMD();
 
         engine = new PimdEngine(
@@ -98,38 +125,61 @@ abstract contract PimdBaseTest is Test {
             })
         );
 
-        cfg = PimdHook.Config({
-            launchCapSeconds: 600,
-            launchCapBlocks: 6000, // ~10 minutes at ~10 blocks/s
-            launchBuyCap: 50e18, // 50 IMD per buyer while the window is open
-            burnThreshold: 1e18,
-            burnCap: 100e18,
-            callerTip: 0.01e18
-        });
+        // The factory deploys the token first and holds the supply, so the token takes no constructor
+        // argument. Its salt is still mined so PIMD sorts above IMD: the hook refuses the other ordering.
+        token = PimdToken(_deployTokenAbove(address(imd)));
 
-        bytes memory args = abi.encode(manager, address(imd), address(engine), team, address(this), cfg);
+        bytes memory args = abi.encode(manager, address(token), address(engine), team);
         (address hookAddr, bytes32 hookSalt) =
-            HookMiner.find(address(this), HOOK_FLAGS, type(PimdHook).creationCode, args);
-        hook = new PimdHook{salt: hookSalt}(manager, address(imd), address(engine), team, address(this), cfg);
+            HookMiner.find(address(this), HOOK_FLAGS, type(PimdHookHarness).creationCode, args);
+        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team))));
         require(address(hook) == hookAddr, "hook addr");
 
-        token = PimdToken(_deployTokenAbove(address(imd), hookAddr));
-        require(uint160(address(token)) > uint160(address(imd)), "currency order");
-
-        hook.launch(IPimdToken(address(token)), TICK_LOWER, START_TICK, SPACING);
+        _openPoolAsFactory();
         engine.bind(address(token), address(hook));
         key = hook.poolKey();
         id = key.toId();
     }
 
-    /// Mines a CREATE2 salt so the token's address sorts above IMD. The deploy script does the same thing.
-    function _deployTokenAbove(address imd_, address receiver) internal returns (address) {
-        bytes32 initHash = keccak256(abi.encodePacked(type(PimdToken).creationCode, abi.encode(receiver)));
+    /// Opens the pool and seeds it exactly as the launch factory does: an outside party initializes through
+    /// the PoolManager at the briefed price, then makes one single-sided liquidity add. Nothing the hook
+    /// does here is special-cased for the caller.
+    function _openPoolAsFactory() internal {
+        PoolKey memory k = PoolKey({
+            currency0: Currency.wrap(address(imd)),
+            currency1: Currency.wrap(address(token)),
+            fee: 12_500,
+            tickSpacing: SPACING,
+            hooks: IHooks(address(hook))
+        });
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+
+        uint256 amount = token.balanceOf(address(this)) * 9 / 10; // the policy seeds 90% of our share
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
+            TickMath.getSqrtPriceAtTick(TICK_LOWER), TickMath.getSqrtPriceAtTick(START_TICK), amount
+        );
+        token.approve(address(lpRouter), type(uint256).max);
+        imd.approve(address(lpRouter), type(uint256).max);
+        lpRouter.modifyLiquidity(
+            k,
+            ModifyLiquidityParams({
+                tickLower: TICK_LOWER,
+                tickUpper: START_TICK,
+                liquidityDelta: int256(uint256(liquidity)),
+                salt: 0
+            }),
+            ""
+        );
+    }
+
+    /// Mines a CREATE2 salt so the token's address sorts above IMD, which is what keeps IMD as currency0.
+    function _deployTokenAbove(address imd_) internal returns (address) {
+        bytes32 initHash = keccak256(type(PimdToken).creationCode);
         for (uint256 i; i < 100_000; ++i) {
             bytes32 salt = bytes32(i);
             address predicted = vm.computeCreate2Address(salt, initHash, address(this));
             if (uint160(predicted) > uint160(imd_)) {
-                PimdToken t = new PimdToken{salt: salt}(receiver);
+                PimdToken t = new PimdToken{salt: salt}();
                 require(address(t) == predicted, "create2");
                 return address(t);
             }
@@ -147,8 +197,8 @@ abstract contract PimdBaseTest is Test {
     }
 
     function _pastLaunchCap() internal {
-        _mineL2(cfg.launchCapBlocks + 1);
-        vm.warp(block.timestamp + cfg.launchCapSeconds + 1);
+        _mineL2(hook.launchCapBlocks() + 1);
+        vm.warp(block.timestamp + hook.launchCapSeconds() + 1);
     }
 
     // ---- trading ----

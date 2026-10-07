@@ -185,7 +185,7 @@ contract PimdAttacksTest is PimdBaseTest {
         _register(alice);
         vm.warp(block.timestamp + 2 days);
         vm.prank(keeper);
-        hook.flushPayouts();
+        hook.flush();
 
         uint256 potBefore = imd.balanceOf(address(engine));
         vm.warp(block.timestamp + 30 days); // keeper has been dead for a month

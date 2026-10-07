@@ -10,10 +10,15 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {PimdToken} from "../../src/pimd/PimdToken.sol";
 import {PimdHook, IPimdToken} from "../../src/pimd/PimdHook.sol";
 import {PimdEngine} from "../../src/pimd/PimdEngine.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {PimdHookHarness} from "./PimdBase.t.sol";
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -47,6 +52,7 @@ contract PimdForkTest is Test {
     IPoolManager manager;
     IERC20 imd;
     PoolSwapTest router;
+    PoolModifyLiquidityTest lpRouter;
     PimdToken token;
     PimdHook hook;
     PimdEngine engine;
@@ -65,6 +71,7 @@ contract PimdForkTest is Test {
         require(IMD.code.length > 0, "no IMD on this fork");
 
         router = new PoolSwapTest(manager);
+        lpRouter = new PoolModifyLiquidityTest(manager);
         engine = new PimdEngine(
             PimdEngine.Config({
                 poolManager: POOL_MANAGER,
@@ -80,31 +87,49 @@ contract PimdForkTest is Test {
             })
         );
 
-        PimdHook.Config memory hc = PimdHook.Config({
-            launchCapSeconds: 600,
-            launchCapBlocks: 6000,
-            launchBuyCap: 25e18,
-            burnThreshold: 1e18,
-            burnCap: 100e18,
-            callerTip: 0.01e18
-        });
-
-        bytes memory args = abi.encode(manager, IMD, address(engine), team, address(this), hc);
-        (address hookAddr, bytes32 hookSalt) = HookMiner.find(address(this), FLAGS, type(PimdHook).creationCode, args);
-        hook = new PimdHook{salt: hookSalt}(manager, IMD, address(engine), team, address(this), hc);
-        require(address(hook) == hookAddr, "hook addr");
-
-        bytes32 initHash = keccak256(abi.encodePacked(type(PimdToken).creationCode, abi.encode(hookAddr)));
+        // The token is deployed first and holds the supply, exactly as the launch factory does it. Its
+        // salt is still mined so PIMD sorts above the real IMD and IMD stays currency0.
+        bytes32 initHash = keccak256(type(PimdToken).creationCode);
         for (uint256 i; i < 100_000; ++i) {
             address predicted = vm.computeCreate2Address(bytes32(i), initHash, address(this));
             if (uint160(predicted) > uint160(IMD)) {
-                token = new PimdToken{salt: bytes32(i)}(hookAddr);
+                token = new PimdToken{salt: bytes32(i)}();
                 break;
             }
         }
         require(address(token) != address(0) && uint160(address(token)) > uint160(IMD), "token order");
 
-        hook.launch(IPimdToken(address(token)), TICK_LOWER, START_TICK, SPACING);
+        bytes memory args = abi.encode(manager, address(token), address(engine), team);
+        (address hookAddr, bytes32 hookSalt) =
+            HookMiner.find(address(this), FLAGS, type(PimdHookHarness).creationCode, args);
+        hook = PimdHook(payable(address(new PimdHookHarness{salt: hookSalt}(manager, address(token), address(engine), team))));
+        require(address(hook) == hookAddr, "hook addr");
+
+        // Open and seed the pool the way the factory will: from outside, through the PoolManager.
+        PoolKey memory k = PoolKey({
+            currency0: Currency.wrap(IMD),
+            currency1: Currency.wrap(address(token)),
+            fee: 12_500,
+            tickSpacing: SPACING,
+            hooks: IHooks(address(hook))
+        });
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+        uint256 seed = token.balanceOf(address(this)) * 9 / 10;
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
+            TickMath.getSqrtPriceAtTick(TICK_LOWER), TickMath.getSqrtPriceAtTick(START_TICK), seed
+        );
+        token.approve(address(lpRouter), type(uint256).max);
+        imd.approve(address(lpRouter), type(uint256).max);
+        lpRouter.modifyLiquidity(
+            k,
+            ModifyLiquidityParams({
+                tickLower: TICK_LOWER,
+                tickUpper: START_TICK,
+                liquidityDelta: int256(uint256(liquidity)),
+                salt: 0
+            }),
+            ""
+        );
         engine.bind(address(token), address(hook));
         key = hook.poolKey();
 
@@ -178,24 +203,23 @@ contract PimdForkTest is Test {
 
         uint256 received = imd.balanceOf(alice) - before;
         assertGt(received, 0, "alice got real IMD out");
-        assertApproxEqRel(hook.totalTaxed() - taxed, received * 700 / 9300, 1e12, "7% in real IMD");
+        assertApproxEqRel(hook.totalTaxed() - taxed, received * 560 / 9440, 1e12, "7% in real IMD");
     }
 
-    function test_fork_flush_moves_real_imd_and_burns_supply() public {
+    function test_fork_flush_moves_real_imd() public {
         vm.warp(block.timestamp + 601); // past the per-buyer cap window
         _buy(alice, 500e18);
 
         uint256 holders = hook.holdersOwed();
         uint256 supplyBefore = token.totalSupply();
-        assertTrue(hook.burnReady(), "burn budget armed");
 
         vm.prank(keeper);
-        (,,, uint256 burned) = hook.flush();
+        hook.flush();
 
         assertEq(imd.balanceOf(address(engine)), holders, "engine holds real IMD");
         assertGt(imd.balanceOf(team), 0, "team paid in real IMD");
-        assertGt(burned, 0, "PIMD bought back");
-        assertEq(token.totalSupply(), supplyBefore - burned, "supply actually fell");
+        assertEq(token.totalSupply(), supplyBefore, "supply is fixed; the burn happens off the tax now");
+        assertEq(hook.claimBalance(), 0, "nothing left behind");
     }
 
     function test_fork_engine_drips_real_imd_to_a_holder() public {
