@@ -182,8 +182,13 @@ contract PimdEngine is ReentrancyGuard {
     event PayoutFailed(address indexed holder, uint256 amount);
     event Registered(address indexed holder);
     event Pruned(address indexed holder);
-    /// @notice A registration passed over because the set was full and the sweep found nothing to
-    /// reclaim. The one skip reason a caller cannot predict off chain, so it is the one that says so.
+    /// @notice A registration passed over because the set was full and no slot could be freed. The one
+    /// skip reason a caller cannot predict off chain, so it is the one that says so.
+    /// @dev Two different causes, which this does not distinguish. Either the sweep ran and found eight
+    /// live entries, or an epoch was in flight and `_reclaimSlot` declined to sweep at all. So `cursor`
+    /// is where the next sweep will start, which is that variable's own meaning -- it is NOT how far
+    /// this call looked, and during an epoch nothing looked anywhere. Do not read a run of these as
+    /// evidence that the set is wedged: every epoch produces them.
     event RegistrationDeferred(address indexed holder, uint256 cursor);
 
     // ------------------------------------------------------------------ errors
@@ -461,7 +466,9 @@ contract PimdEngine is ReentrancyGuard {
     /// let a handful of hostile registrations cut the achievable set by two thirds. The check belongs at
     /// `register`, where the registrant pays for it and a pair cannot get in to begin with.
     ///
-    /// What is called here is `_shapeChanged`, which costs one `EXTCODESIZE` and calls nothing. `register`
+    /// What is called here is `_shapeChanged`, which costs an `EXTCODESIZE`, plus an `EXTCODECOPY` for the
+    /// 23-byte case, and calls nothing -- measured at 33.6k gas a holder, or 33.8k if every holder in the
+    /// set carries a delegation stub. `register`
     /// can only probe what is in front of it, and it passes a codeless address without probing at all, so
     /// an address CREATE2 chose could be registered empty, left to mature a streak, and only then given
     /// pair code. Re-probing would catch it and cannot be afforded; noticing that code arrived where there
@@ -505,10 +512,16 @@ contract PimdEngine is ReentrancyGuard {
                 pot += epochQuote;
                 epochQuote = 0;
                 phase = Phase.Idle;
-                // And no tip. This epoch hands the whole drip back, so there is nothing to be paid out
-                // of: billing the pot for weighing a set that turned out to be worth nothing let a
-                // keeper bleed it a little on every first-hour cycle. Returning the budget as well keeps
-                // `pay`'s share of it from being spent on an epoch that never reached `pay`.
+                // And no per-holder tip: this epoch hands the whole drip back, so there is nothing to
+                // be paid out of. Closing the budget as well stops the rest of it being spent on an
+                // epoch that never reaches `pay`.
+                //
+                // This does NOT make a null epoch free. `fire` paid `fireTip` at the top, before
+                // anything had been weighed and before anything could know the epoch was worthless,
+                // and that is gone from the pot. `fire` is permissionless while this is keeper-only,
+                // so the two are not even the same caller. `lastFire` has advanced too, so the
+                // window's release is deferred rather than lost. Bounded by `minInterval` and by the
+                // same 5% budget, but not closed.
                 tipBudget = 0;
                 return;
             }
@@ -701,11 +714,14 @@ contract PimdEngine is ReentrancyGuard {
     /// Swap-and-pop one entry out of the holder set. Callers must have checked that the entry may go and
     /// that no epoch is mid-flight: both `tally` and `pay` walk `holders` against the `epochCount` taken at
     /// `fire`, so shortening it under them was the brick that C2 was about.
-    /// @dev The order of the next four lines is load-bearing. `index1` must be written before `pop`,
-    /// because when `a` is itself the last element the write lands in the entry that is about to die and
-    /// `delete` then clears it. Writing it after `pop` would leave a removed address holding
-    /// `index1 == n`, and the next `prune` of it would index `n - 1` of an array of length `n - 1` and
-    /// revert out of bounds, for that address, for every caller, for ever.
+    /// @dev Two orderings below are load-bearing, and it is worth being exact about which.
+    /// `holders[idx0] = last` must precede `holders.pop()`, or the moved entry is written into a slot
+    /// that no longer exists. And `_holder[last].index1 = ...` must precede `delete _holder[a]` -- not
+    /// `pop`, which touches only the array -- because when `a` is itself the last element both writes
+    /// address the same record, and it is the `delete` that has to land second. Put the `index1` write
+    /// after the `delete` and a removed address keeps `index1 == n`; the next `prune` of it indexes
+    /// `n - 1` of an array of length `n - 1` and reverts out of bounds, for that address, for every
+    /// caller, for ever.
     function _removeAt(uint256 idx0, address a) internal {
         address last = holders[holders.length - 1];
         holders[idx0] = last;
@@ -739,19 +755,26 @@ contract PimdEngine is ReentrancyGuard {
     }
 
     /// True when an address no longer has the shape `register` vetted: it had no code then and has code now.
-    /// `_isPool` cannot be afforded in the tally loop, but this can -- one `EXTCODESIZE`, and unlike a probe it
-    /// calls nothing, so a holder cannot burn gas or bomb return data to make it cost more. It is deliberately
-    /// blunt: any code arriving at an address that was vetted codeless voids the verdict, because the pair that
-    /// lands there is indistinguishable in advance from anything else. A holder this catches earns nothing, and
+    /// `_isPool` cannot be afforded in the tally loop, but this can -- an `EXTCODESIZE`, plus an
+    /// `EXTCODECOPY` in the 23-byte case, and unlike a probe it calls nothing, so a holder cannot burn gas
+    /// or bomb return data to make it cost more. It is blunt, with exactly one exception, below: any code
+    /// arriving at an address that was vetted codeless voids the verdict, because the pair that lands there
+    /// is indistinguishable in advance from anything else. A holder this catches earns nothing, and
     /// `prune` drops it on the same test, so the address can be registered again on its real shape.
     ///
     /// One shape is carved out: an EIP-7702 delegation, which is the 23 bytes `0xef0100` followed by the
     /// delegate's address. A plain wallet gains exactly that the moment its owner installs one, and
     /// treating it as a shape change meant a legitimate holder silently earned nothing and could be
     /// pruned by any stranger -- which also destroyed a matured streak, because registering again
-    /// restarts the clock. Carving it out does not reopen what this check is for: code deployed at a
-    /// CREATE2 address is not a 23-byte stub, so it still trips. A delegate that answers `token0()` with
-    /// PIMD is still caught, by `_isPool` at `register` and `prune`, exactly as any other contract is.
+    /// restarts the clock.
+    ///
+    /// Carving it out does not reopen what this check is for, but not because of the length: a CREATE2
+    /// deploy can produce exactly 23 bytes of runtime code. It is the prefix that cannot be forged.
+    /// EIP-3541 refuses to deploy any code beginning `0xEF` through CREATE or CREATE2, so `0xef0100` at
+    /// the head of an account's code can only have arrived as a delegation designator. The length test
+    /// is a cheap pre-filter, not the guarantee. A delegate that answers `token0()` with PIMD is still
+    /// caught by `_isPool` at `register` and `prune` -- but `tally` never re-probes, so such a holder
+    /// earns until somebody prunes it, and that is the one thing this exception widens.
     function _shapeChanged(address a, Holder storage h) internal view returns (bool) {
         if (!h.vettedCodeless) return false;
         uint256 len = a.code.length;
@@ -760,6 +783,11 @@ contract PimdEngine is ReentrancyGuard {
 
     /// True when the first three bytes of `a`'s code are EIP-7702's `0xef0100` marker. Only ever called
     /// when the code is already known to be 23 bytes long, which is that marker plus one address.
+    /// @dev What makes this correct is `extcodecopy` zero-padding inside the three bytes it was asked
+    /// for, and `shr(232)` keeping exactly those three (256 - 232 = 24 bits). The `mstore` is belt and
+    /// braces and is in fact dead, because the shift discards every byte it zeroes -- so do not remove
+    /// the shift or widen the copy on the assumption that the `mstore` is what keeps this safe. Writing
+    /// 32 bytes at the free pointer without advancing it is the allowed scratch use, as in `_probe`.
     function _isDelegationStub(address a) internal view returns (bool ok) {
         assembly ("memory-safe") {
             let ptr := mload(0x40)
