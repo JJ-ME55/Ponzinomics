@@ -269,8 +269,8 @@ contract PimdEngine is ReentrancyGuard {
         _tip(fireTip);
     }
 
-    /// @notice First pass: reads each holder's PIMD balance, updates the hold streak, records this epoch's weight.
-    /// @notice Weighs every registered holder for this epoch. It must cover all of them in one call.
+    /// @notice First pass: reads every registered holder's PIMD balance, updates the hold streak and records
+    /// this epoch's weight. It must cover all of them in one call.
     /// @dev Paging this is what let one bag be counted once per wallet it was moved through: weights are
     /// read from live balances, so a page boundary is a window to transfer the bag and be weighed again.
     /// With N wallets a sybil took N/(N+1) of the epoch out of the honest holders' share. Weighing the
