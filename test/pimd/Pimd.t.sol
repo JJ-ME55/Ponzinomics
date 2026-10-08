@@ -372,26 +372,7 @@ contract PimdTest is PimdBaseTest {
     /// dripped to it is stranded in a contract forever. It has to be excluded at bind.
     function test_an_excluded_holder_is_never_registered_or_paid() public {
         _pastLaunchCap();
-        address distributor = makeAddr("distributor");
-
-        PimdEngine fresh = new PimdEngine(
-            PimdEngine.Config({
-                poolManager: address(manager),
-                imd: address(imd),
-                team: team,
-                binder: address(this),
-                dripBpsPerPeriod: 400,
-                minInterval: 2 minutes,
-                minBalance: 100_000e18,
-                fireTip: 0,
-                tipPerHolder: 0,
-                maxCatchup: 6 hours
-            })
-        );
-        address[] memory extra = new address[](1);
-        extra[0] = distributor;
-        fresh.bind(address(token), address(hook), extra);
-        assertTrue(fresh.excluded(distributor), "named at bind");
+        assertTrue(engine.excluded(distributor), "named at bind");
 
         // give it a real bag, the way the airdrop would
         _buy(alice, 300e18);
@@ -401,8 +382,8 @@ contract PimdTest is PimdBaseTest {
 
         address[] memory one = new address[](1);
         one[0] = distributor;
-        fresh.register(one);
-        assertEq(fresh.holderCount(), 0, "an excluded address cannot register, however big its bag");
+        engine.register(one);
+        assertEq(engine.holderCount(), 0, "an excluded address cannot register, however big its bag");
     }
 
     // ------------------------------------------------------------------ the liquidity lock

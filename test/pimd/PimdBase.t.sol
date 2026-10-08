@@ -170,6 +170,8 @@ abstract contract PimdBaseTest is Test {
     address bob = makeAddr("bob");
     address carol = makeAddr("carol");
     address keeper = makeAddr("keeper");
+    /// Stands in for the launch factory's airdrop distributor, excluded at bind.
+    address distributor = makeAddr("distributor");
 
     MockArbSys sys;
 
@@ -210,7 +212,9 @@ abstract contract PimdBaseTest is Test {
         require(address(hook) == hookAddr, "hook addr");
 
         _openPoolAsFactory();
-        engine.bind(address(token), address(hook), new address[](0));
+        address[] memory neverPay = new address[](1);
+        neverPay[0] = distributor;
+        engine.bind(address(token), address(hook), neverPay);
         key = hook.poolKey();
         id = key.toId();
     }

@@ -78,6 +78,7 @@ contract PimdHook is IHooks, IUnlockCallback {
     uint24 internal constant FEE_TIER_LAUNCH = 12_500;
 
     uint8 private constant ACTION_FLUSH = 2;
+    uint8 private constant ACTION_HOLDERS = 4;
 
     uint256 private constant _FEE_SLOT = uint256(keccak256("pimd.hook.fee")) - 1;
     uint256 private constant _UNLOCK_SLOT = uint256(keccak256("pimd.hook.unlocking")) - 1;
@@ -402,6 +403,24 @@ contract PimdHook is IHooks, IUnlockCallback {
     }
 
     // ------------------------------------------------------------------ moving the money
+    /// @notice Pays the holders' slice to the engine and nothing else. `flush` pays the engine, the team
+    /// and the caller's tip in one unlock, so if IMD ever refused the team wallet the holders' IMD would be
+    /// stranded here with it. This path cannot be blocked by anything the team wallet does, and anyone can
+    /// call it.
+    function flushHolders() external nonReentrant returns (uint256 toHolders) {
+        if (!launched) revert NotLaunched();
+        toHolders = holdersOwed;
+        if (toHolders == 0) revert NothingPending();
+        holdersOwed = 0;
+
+        _tstore(_UNLOCK_SLOT, 1);
+        poolManager.unlock(abi.encode(ACTION_HOLDERS, toHolders));
+        _tstore(_UNLOCK_SLOT, 0);
+
+        totalToHolders += toHolders;
+        emit Flushed(msg.sender, toHolders, 0, 0);
+    }
+
     /// @notice Permissionless. Pushes the holders' IMD to the engine, pays the team, and if the burn budget is
     /// armed, buys PIMD off the pool with it and destroys it. The caller's tip comes out of the team's slice,
     /// never out of holders or burns.
@@ -430,6 +449,12 @@ contract PimdHook is IHooks, IUnlockCallback {
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
         if (_tload(_UNLOCK_SLOT) != 1) revert NotUnlocking();
         uint8 action = abi.decode(data, (uint8));
+
+        if (action == ACTION_HOLDERS) {
+            (, uint256 toHolders) = abi.decode(data, (uint8, uint256));
+            _payOut(engine(), toHolders);
+            return "";
+        }
 
         if (action == ACTION_FLUSH) {
             (, uint256 toHolders, uint256 toTeam, address tipTo, uint256 tip) =

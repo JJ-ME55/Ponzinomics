@@ -15,6 +15,9 @@ interface IERC20Min {
 interface IPimdHookLike {
     function flush() external returns (uint256, uint256);
     function holdersOwed() external view returns (uint256);
+    function engine() external view returns (address);
+    function quote() external view returns (address);
+    function poolManager() external view returns (address);
 }
 
 interface IPairLike {
@@ -183,6 +186,13 @@ contract PimdEngine is ReentrancyGuard {
         if (msg.sender != binder) revert NotBinder();
         if (bound) revert AlreadyBound();
         if (token_ == address(0) || hook_ == address(0)) revert BadConfig();
+        // Bind to a hook that actually pays this engine, in this IMD, on this PoolManager. bind is
+        // one-shot, so binding the wrong hook would be unrecoverable and silent: drips would simply
+        // never arrive.
+        IPimdHookLike h = IPimdHookLike(hook_);
+        if (h.engine() != address(this)) revert BadConfig();
+        if (h.quote() != address(imd)) revert BadConfig();
+        if (h.poolManager() != address(poolManager)) revert BadConfig();
         bound = true;
         token = token_;
         hook = IPimdHookLike(hook_);
@@ -229,9 +239,14 @@ contract PimdEngine is ReentrancyGuard {
     }
 
     /// @notice Removes registered holders whose bag has fallen below the minimum, keeping the tally loop lean.
-    /// Only between epochs, so a running epoch's snapshot never moves.
+    /// @dev Allowed while an epoch is waiting to be weighed as well as between epochs, and this matters:
+    /// weighing happens in one call, so a holder set too large for one block would otherwise leave the
+    /// epoch stuck in Tally with no way back, because the only thing that can shrink the set is this
+    /// function. Registration is permissionless and one bag can register many addresses, so without this
+    /// the engine could be bricked for the price of the gas to register them. It is refused during Pay,
+    /// where the weights are already fixed and moving an index would misallocate a payout.
     function prune(address[] calldata accounts) external {
-        if (phase != Phase.Idle) revert WrongPhase();
+        if (phase == Phase.Pay) revert WrongPhase();
         for (uint256 i; i < accounts.length; ++i) {
             address a = accounts[i];
             uint256 idx1 = _holder[a].index1;

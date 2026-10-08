@@ -277,8 +277,11 @@ contract PimdAttacksTest is PimdBaseTest {
         vm.expectRevert(PimdEngine.NotBinder.selector);
         fresh.bind(address(token), address(hook), new address[](0));
 
-        fresh.bind(address(token), address(hook), new address[](0)); // and we can
-        assertTrue(fresh.bound(), "bound by the named binder");
+        // And the binder cannot bind it to a hook that pays somebody else: the live hook names the
+        // engine deployed in setUp, not this one.
+        vm.expectRevert(PimdEngine.BadConfig.selector);
+        fresh.bind(address(token), address(hook), new address[](0));
+        assertFalse(fresh.bound(), "an engine no hook pays stays unbound");
         assertEq(fresh.team(), team, "fees still point at our wallet, whoever deployed");
     }
 
