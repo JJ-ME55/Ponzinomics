@@ -421,9 +421,6 @@ contract PimdHook is IHooks, IUnlockCallback {
         emit Flushed(msg.sender, toHolders, 0, 0);
     }
 
-    /// @notice Permissionless. Pushes the holders' IMD to the engine, pays the team, and if the burn budget is
-    /// armed, buys PIMD off the pool with it and destroys it. The caller's tip comes out of the team's slice,
-    /// never out of holders or burns.
     /// @notice Permissionless. Pushes the holders' IMD to the engine and the team's to the team wallet.
     /// It never touches the pool, so a pool that cannot be swapped against can never stop the drip. The
     /// caller's tip comes out of the team's slice, never out of holders.

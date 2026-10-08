@@ -28,7 +28,7 @@ interface IPairLike {
 }
 
 /// @title PimdEngine
-/// @notice Where the holders' 60% ends up. The hook pushes IMD here; this contract releases it on a time curve
+/// @notice Where the holders' 75% of the tax ends up. The hook pushes IMD here; this contract releases it on a curve
 /// and pushes it into holders' wallets, weighted by PIMD balance times hold-streak tier:
 ///
 ///   under an hour 0x · to a day 0.5x · to three days 1x · to a week 1.5x · to two weeks 2x · after that 3x
