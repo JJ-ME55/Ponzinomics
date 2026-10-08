@@ -70,8 +70,15 @@ contract PimdEngine is ReentrancyGuard {
     /// `fire`, then `tally`, then `pay` -- which starved the end of the queue: at a 20,000 IMD pot with
     /// 700 holders the firer and the tally took the lot and `pay`, an 11.8M gas whole-set transfer loop,
     /// earned nothing at all until the drip passed 43 IMD. `pay` is the call holders actually need, and
-    /// nobody is obliged to make it, so it must not be the one left unpaid. Each phase may now draw only
-    /// down to the floor reserved for the phases after it.
+    /// nobody is obliged to make it, so it must not be the one left unpaid. Each phase draws only down to
+    /// the floor reserved for the phases after it, and inside `pay` each page draws only its pro-rata
+    /// slice of what is left, so finishing an epoch is always the best-paid page rather than the worst.
+    ///
+    /// What these floors do NOT do is ration between actors: they order the draw, so one address holding
+    /// several roles collects every share it turns up for. The only ceiling against that is the
+    /// unchanged `TIP_BUDGET_BPS`, which caps the lot at 5% of the drip however many roles one party
+    /// plays. That is deliberate -- the roles are permissionless by design, and whoever does the work
+    /// should be paid for it -- but it is why the 5% ceiling matters more than the shares do.
     uint256 internal constant FIRE_TIP_FLOOR_BPS = 9_000; // `fire` may take at most a tenth
     uint256 internal constant TALLY_TIP_FLOOR_BPS = 4_500; // `tally` may not touch `pay`'s 45%
     /// @dev How long an epoch may stay open before anyone may abandon it. The engine has no owner, so this
@@ -596,7 +603,23 @@ contract PimdEngine is ReentrancyGuard {
             epochPaidQuote = 0;
             emit EpochPaid(epoch, epochPaidHolders == 0 ? 0 : total - leftover, epochPaidHolders);
         }
-        _tipTo(msg.sender, tipPerHolder * (end - start), 0);
+        // Pro rata, not first come. Reserving 45% of the budget for `pay` reserved it for the phase,
+        // not for the holders still unpaid inside it: `pay` is paged, and the first page drew the whole
+        // phase share down to this floor of zero. Measured on a 1,387 IMD pot with 700 holders, a
+        // caller paging exactly 157 holders took the entire 0.468 IMD reserve, and whoever then
+        // finished the remaining 543 did 9.1M gas of transfers for nothing. Worse than merely unfair:
+        // when nobody volunteered, `abortEpoch` reset `cursor` to 0, so the same prefix was paid again
+        // the next epoch and the tail was never paid at all -- holder 699 received exactly zero across
+        // three epochs while holder 0 was paid in each.
+        //
+        // A page covering `n` of the `m` holders still uncovered may therefore draw at most `n / m` of
+        // what is left. The last page has `n == m` and so can still take the remainder, which is what
+        // keeps finishing an epoch the best-paid thing to do rather than the worst.
+        if (end > start) {
+            uint256 want = tipPerHolder * (end - start);
+            uint256 share = (tipBudget * (end - start)) / (epochCount - start);
+            _tipTo(msg.sender, want < share ? want : share, 0);
+        }
     }
 
     /// @notice Abandons an epoch that has been open for a day without finishing. Permissionless, unpaid.

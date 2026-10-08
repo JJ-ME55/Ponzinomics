@@ -600,6 +600,70 @@ contract PimdFixesTest is PimdBaseTest {
         assertGt(imd.balanceOf(keeper), 0, "and the tallier got its own tip");
     }
 
+    /// Round 4, adversarial, and a flaw in the phase split I added for H1. Reserving 45% of the budget
+    /// for `pay` reserved it for the *phase*, not for the holders still unpaid inside it -- `pay` is
+    /// paged, and its floor was zero, so the first page drew the whole reserve. The reviewer measured a
+    /// caller paging 157 of 700 holders taking the entire 0.468 IMD reserve and leaving whoever finished
+    /// the other 543 to do 9.1M gas of transfers for nothing. And because `abortEpoch` resets `cursor`,
+    /// an epoch nobody finished paid the same prefix again next time: holder 699 got exactly zero across
+    /// three epochs while holder 0 was paid in each.
+    ///
+    /// A page covering n of the m holders still uncovered may now draw at most n/m of what is left, so
+    /// finishing is the best-paid page rather than the worst.
+    ///
+    /// This only bites where the BUDGET binds rather than the entitlement -- the sniper pages exactly
+    /// `tipBudget / tipPerHolder` holders so its entitlement swallows the reserve. My first attempt at
+    /// this test used a healthy pot, where `tipPerHolder` binds instead, and it passed against the bug
+    /// and against two mutations. Hence the drained pot, the tiny top-up, and the precondition asserted
+    /// below before anything else is claimed.
+    function test_a_pay_page_cannot_take_more_than_its_share_of_the_tips() public {
+        _pastLaunchCap();
+        address[3] memory hs = [makeAddr("p1"), makeAddr("p2"), makeAddr("p3")];
+        for (uint256 i; i < 3; ++i) {
+            _buy(hs[i], 120e18);
+            _register(hs[i]);
+        }
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        assertEq(engine.holderCount(), 3, "all three registered");
+        _runEpoch(); // drains most of the pot and sets lastFire
+
+        _buy(carol, 1e18); // a very small top-up, so the next drip is tiny
+        vm.warp(vm.getBlockTimestamp() + 2 minutes); // exactly minInterval
+
+        vm.prank(keeper);
+        engine.fire();
+        vm.prank(keeper);
+        engine.tally(500);
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Pay), "three holders to pay");
+
+        uint256 reserve = engine.tipBudget();
+        assertGt(reserve, 0, "there is a reserve for pay to share out");
+        // The precondition the whole finding rests on: one holder's entitlement is more than a third of
+        // what is left, so a first page of one would have taken the lot under the old flat floor.
+        assertGt(engine.tipPerHolder(), reserve / 3, "the budget binds, not the entitlement");
+
+        address sniper = makeAddr("sniper");
+        vm.prank(sniper);
+        engine.pay(1);
+        uint256 sniped = imd.balanceOf(sniper);
+        assertGt(sniped, 0, "the sniper was paid for the one holder it did");
+        assertLe(sniped, reserve / 3 + 1, "but at most a third of the reserve, for a third of the work");
+        assertGt(engine.tipBudget(), 0, "and most of the reserve survived for the rest");
+
+        address finisher = makeAddr("finisher");
+        vm.prank(finisher);
+        engine.pay(500);
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Idle), "the epoch finished");
+        assertGt(imd.balanceOf(finisher), sniped, "finishing pays better than sniping one page");
+        // And the last page takes the whole remainder -- the denominator counts the holders still
+        // uncovered, not the whole set -- so no part of the reserve is stranded by the split.
+        assertLe(engine.tipBudget(), 2, "the finisher took the remainder, to the wei");
+
+        for (uint256 i; i < 3; ++i) {
+            assertGt(imd.balanceOf(hs[i]), 0, "every holder paid");
+        }
+    }
+
     function _cfg(uint256 maxHolders_) internal view returns (PimdEngine.Config memory) {
         return PimdEngine.Config({
             poolManager: address(manager),
