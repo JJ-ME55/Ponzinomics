@@ -262,6 +262,83 @@ contract PimdFixesTest is PimdBaseTest {
         assertGt(1_200 * worstCasePerHolder, ARBOS_MAX_TX_GAS, "nor was the original 1,200");
     }
 
+    // ================================================================= audit over f182e9f
+    /// Round 2's high. Weighing on min(bal, lastBal) does not survive a caller who chooses both instants:
+    /// present with a borrowed bag at two tallies of their own making, an attacker is weighed on it in
+    /// full, because `lastBal` is written from whatever balance the call happens to see. No snapshot taken
+    /// at an instant the attacker picks can fix that, so `tally` takes the instant away from them.
+    function test_only_a_keeper_can_tally() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        _register(alice);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        vm.prank(keeper);
+        engine.fire();
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Tally), "an epoch is open");
+
+        // the attacker is exactly who must not be able to choose the read instant
+        vm.prank(alice);
+        vm.expectRevert(PimdEngine.NotKeeper.selector);
+        engine.tally(500);
+        vm.prank(address(this));
+        vm.expectRevert(PimdEngine.NotKeeper.selector);
+        engine.tally(500);
+        assertFalse(engine.keeper(alice), "alice is not a keeper");
+        assertTrue(engine.keeper(keeper), "the keeper is");
+
+        vm.prank(keeper);
+        engine.tally(500);
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Pay), "and the keeper can");
+    }
+
+    /// The point of restricting only `tally`: a distribution can still always be finished, a stalled epoch
+    /// can still always be released, and holders can still be enrolled, by anyone at all. If this ever
+    /// fails, the cost of the high's fix has grown beyond what was agreed.
+    function test_everything_except_tally_stays_permissionless() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        address stranger = makeAddr("stranger");
+
+        // register, by a stranger, for someone else
+        vm.prank(stranger);
+        _register(alice);
+        (bool reg,,,,) = engine.holderInfo(alice);
+        assertTrue(reg, "a stranger registered a holder");
+
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        vm.prank(stranger);
+        engine.fire(); // fire: permissionless
+        vm.prank(keeper);
+        engine.tally(500);
+        vm.prank(stranger);
+        engine.pay(500); // pay: permissionless
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Idle), "a stranger finished the epoch");
+        assertGt(imd.balanceOf(alice), 0, "and the holder was paid");
+
+        // prune: permissionless
+        uint256 bag = token.balanceOf(alice);
+        vm.prank(alice);
+        token.transfer(stranger, bag);
+        address[] memory one = new address[](1);
+        one[0] = alice;
+        vm.prank(stranger);
+        engine.prune(one);
+        assertEq(engine.holderCount(), 0, "a stranger pruned a dead holder");
+    }
+
+    /// An engine with no keeper could never weigh an epoch, and with no owner could never be given one.
+    function test_an_engine_with_no_keeper_cannot_be_deployed() public {
+        PimdEngine.Config memory c = _cfg(10);
+        c.keepers = new address[](0);
+        vm.expectRevert(PimdEngine.BadConfig.selector);
+        new PimdEngine(c);
+
+        c.keepers = new address[](1);
+        c.keepers[0] = address(0);
+        vm.expectRevert(PimdEngine.BadConfig.selector);
+        new PimdEngine(c);
+    }
+
     function _cfg(uint256 maxHolders_) internal view returns (PimdEngine.Config memory) {
         return PimdEngine.Config({
             poolManager: address(manager),
@@ -274,7 +351,8 @@ contract PimdFixesTest is PimdBaseTest {
             fireTip: 0.01e18,
             tipPerHolder: 0.0001e18,
             maxCatchup: 6 hours,
-            maxHolders: maxHolders_
+            maxHolders: maxHolders_,
+            keepers: _keeperList()
         });
     }
 
@@ -487,7 +565,8 @@ contract PimdFixesTest is PimdBaseTest {
                 fireTip: 0.01e18,
                 tipPerHolder: 0.0001e18,
                 maxCatchup: 6 hours,
-                maxHolders: 800
+                maxHolders: 800,
+                keepers: _keeperList()
             })
         );
         // the live hook names the engine from setUp, so this one cannot bind to it at all
@@ -511,7 +590,8 @@ contract PimdFixesTest is PimdBaseTest {
             fireTip: 0.01e18,
             tipPerHolder: 0.0001e18,
             maxCatchup: 6 hours,
-            maxHolders: 0
+            maxHolders: 0,
+            keepers: _keeperList()
         });
         vm.expectRevert(PimdEngine.BadConfig.selector);
         new PimdEngine(c);

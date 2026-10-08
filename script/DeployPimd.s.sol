@@ -23,6 +23,9 @@ contract DeployPimd is Script {
 
     /// @dev Receives the team's 25% of the tax, in IMD, and is the wallet that may call `bind` once.
     address constant DEFAULT_TEAM = 0x0960E8Bd80462e3842Bb6620c7C5289A44c4559B;
+    /// The two keeper boxes. Only these may call `tally`; see `PimdEngine.keeper`.
+    address constant DEFAULT_KEEPER_A = 0x244FA8fd099493fDd4c518000fa552a3950A172D;
+    address constant DEFAULT_KEEPER_B = 0x25BfA297E2705151376517deA4f97EFFcBED5B98;
 
     function run() external {
         uint256 pk = vm.envUint("PRIVATE_KEY");
@@ -45,6 +48,11 @@ contract DeployPimd is Script {
         require(pm.code.length > 0, "PoolManager has no code");
         require(imd.code.length > 0, "IMD has no code");
 
+        address[] memory keepers = new address[](2);
+        keepers[0] = vm.envOr("KEEPER_A", DEFAULT_KEEPER_A);
+        keepers[1] = vm.envOr("KEEPER_B", DEFAULT_KEEPER_B);
+        require(keepers[0] != keepers[1], "keepers must differ");
+
         PimdEngine.Config memory ec = PimdEngine.Config({
             poolManager: pm,
             imd: imd,
@@ -63,7 +71,10 @@ contract DeployPimd is Script {
             // balances move between tallies, which is the case that counts; the 34.6k in Gas.t.sol is
             // the cheap state where no balance changed. So 700 is about 26M, 81% of the budget, under a
             // constructor ceiling of 800 (29.6M). 1,200 was 44M and could never have been weighed.
-            maxHolders: vm.envOr("MAX_HOLDERS", uint256(700))
+            maxHolders: vm.envOr("MAX_HOLDERS", uint256(700)),
+            // `tally` is keeper-only: it is the one read an attacker must not be able to time. Two boxes,
+            // because this is set in the constructor and there is no way to appoint another later.
+            keepers: keepers
         });
 
         vm.broadcast(pk);

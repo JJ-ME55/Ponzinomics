@@ -107,6 +107,9 @@ contract PimdEngine is ReentrancyGuard {
         uint256 tipPerHolder;
         uint256 maxCatchup;
         uint256 maxHolders;
+        /// Who may call `tally`. Set once, in the constructor, and never afterwards. More than one so the
+        /// loss of a single box does not stop the drip; see `keeper` for what their loss would mean.
+        address[] keepers;
     }
 
     // ------------------------------------------------------------------ bound state
@@ -114,6 +117,18 @@ contract PimdEngine is ReentrancyGuard {
     address public token; // PIMD
     IPimdHookLike public hook;
     mapping(address => bool) public excluded;
+    /// @notice Who may call `tally`. Fixed in the constructor; there is no setter and no owner to add one.
+    /// @dev `tally` is the one read an attacker must not be able to time. Weighing on min(bal, lastBal)
+    /// does not survive a caller who chooses both instants: present with a borrowed bag at two tallies of
+    /// their own making, they are weighed on it in full, because `lastBal` is written from whatever
+    /// balance the call happens to see. No snapshot taken at an instant the attacker picks can fix that,
+    /// so the instant is taken away from them instead. Everything else stays permissionless -- `fire`,
+    /// `pay`, `register`, `prune` and `abortEpoch` -- so a distribution can always be finished and a
+    /// stalled epoch can always be released by anyone. The cost, stated plainly: if every keeper here is
+    /// lost, no epoch can be weighed again. Nothing is stolen and nothing is stuck -- `abortEpoch` returns
+    /// each epoch's IMD to the pot and the pot keeps accruing -- but the drip stops until a keeper
+    /// returns, and no one can appoint a new one.
+    mapping(address => bool) public keeper;
 
     // ------------------------------------------------------------------ IMD ledger: pot + epochQuote <= balance
     uint256 public pot; // IMD waiting to be dripped
@@ -158,6 +173,7 @@ contract PimdEngine is ReentrancyGuard {
     // ------------------------------------------------------------------ events
     event Bound(address indexed token, address indexed hook);
     event Excluded(address indexed account);
+    event KeeperSet(address indexed keeper);
     event Seeded(address indexed from, uint256 amount);
     event Income(uint256 amount);
     event Fired(uint256 indexed epoch, uint256 imdForHolders, uint256 holderCount);
@@ -179,6 +195,7 @@ contract PimdEngine is ReentrancyGuard {
     error HolderSetFull(uint256 max);
     error TooSoon();
     error BadConfig();
+    error NotKeeper();
     error PoolUnlocked();
 
     constructor(Config memory c) {
@@ -211,6 +228,13 @@ contract PimdEngine is ReentrancyGuard {
         tipPerHolder = c.tipPerHolder;
         maxCatchup = c.maxCatchup;
         maxHolders = c.maxHolders;
+        // An engine with no keeper could never weigh an epoch, and could never be given one.
+        if (c.keepers.length == 0) revert BadConfig();
+        for (uint256 i; i < c.keepers.length; ++i) {
+            if (c.keepers[i] == address(0)) revert BadConfig();
+            keeper[c.keepers[i]] = true;
+            emit KeeperSet(c.keepers[i]);
+        }
     }
 
     // ================================================================== one-time setup
@@ -425,6 +449,7 @@ contract PimdEngine is ReentrancyGuard {
     /// pair code. Re-probing would catch it and cannot be afforded; noticing that code arrived where there
     /// was none is nearly free, and takes the weight away the same epoch.
     function tally(uint256 maxHolders) external nonReentrant {
+        if (!keeper[msg.sender]) revert NotKeeper();
         if (phase != Phase.Tally) revert WrongPhase();
         _requireLocked();
         uint256 start = cursor;

@@ -207,7 +207,8 @@ abstract contract PimdBaseTest is Test {
                 fireTip: 0.02e18, // IMD
                 tipPerHolder: 0.0005e18,
                 maxCatchup: 6 hours,
-                maxHolders: _maxHolders()
+                maxHolders: _maxHolders(),
+                keepers: _keeperList()
             })
         );
 
@@ -376,6 +377,13 @@ abstract contract PimdBaseTest is Test {
         imd.mint(address(this), 1_000_000e18);
         ERC20(pimd).approve(address(lpRouter), type(uint256).max);
         imd.approve(address(lpRouter), type(uint256).max);
+    }
+
+    /// The addresses allowed to call `tally`. Only `keeper` is one, which is why every helper that
+    /// advances an epoch pranks it; a test that tallies as anyone else is asserting the guard.
+    function _keeperList() internal view returns (address[] memory ks) {
+        ks = new address[](1);
+        ks[0] = keeper;
     }
 
     /// The holder-set bound the engine under test is deployed with. Overridden by the test that proves the

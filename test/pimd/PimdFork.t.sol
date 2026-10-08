@@ -76,6 +76,8 @@ contract PimdForkTest is Test {
         router = new PoolSwapTest(manager);
         lpRouter = new PoolModifyLiquidityTest(manager);
         factory = new MockLaunchFactory(manager);
+        address[] memory ks = new address[](1);
+        ks[0] = keeper;
         engine = new PimdEngine(
             PimdEngine.Config({
                 poolManager: POOL_MANAGER,
@@ -88,7 +90,8 @@ contract PimdForkTest is Test {
                 fireTip: 0.01e18,
                 tipPerHolder: 0.0001e18,
                 maxCatchup: 6 hours,
-                maxHolders: 800
+                maxHolders: 800,
+                keepers: ks
             })
         );
 
