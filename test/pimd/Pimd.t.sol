@@ -386,6 +386,54 @@ contract PimdTest is PimdBaseTest {
         assertEq(engine.holderCount(), 0, "an excluded address cannot register, however big its bag");
     }
 
+    /// PIMD can be sent to its own address, and nothing can ever move it out again: PimdToken holds no
+    /// logic that forwards a balance and nobody holds its key. So if the token address could register, every
+    /// later epoch would strand a share of the IMD drip in it, and `prune` could never undo that, because the
+    /// PIMD parked there is stuck above the minimum for good. Same shape as the distributor above, except
+    /// nobody has to make a mistake for it to happen: one transfer by anyone sets it up.
+    function test_the_token_address_is_never_registered_or_paid() public {
+        _pastLaunchCap();
+
+        // park a registerable bag at the token's own address
+        _buy(alice, 300e18);
+        uint256 bag = token.balanceOf(alice);
+        vm.prank(alice);
+        token.transfer(address(token), bag);
+        assertGe(token.balanceOf(address(token)), engine.minBalance(), "a registerable bag sits at the token");
+
+        address[] memory one = new address[](1);
+        one[0] = address(token);
+        engine.register(one);
+        assertEq(engine.holderCount(), 0, "the token address did not register");
+        assertTrue(engine.excluded(address(token)), "the token address is excluded at bind");
+
+        // and it draws nothing once a real holder is being paid
+        _buy(bob, 300e18);
+        _register(bob);
+        vm.warp(block.timestamp + 2 days); // past the first hour, so bob's bag actually earns
+        uint256 before = imd.balanceOf(address(token));
+        _runEpoch();
+        assertGt(imd.balanceOf(bob), 0, "a real holder was paid");
+        assertEq(imd.balanceOf(address(token)), before, "no IMD was stranded at the token address");
+    }
+
+    /// The payout asset's own contract is in the same position: it cannot forward an IMD payout either, and
+    /// one transfer by anyone parks a registerable PIMD bag on it.
+    function test_the_imd_address_is_never_registered() public {
+        _pastLaunchCap();
+        _buy(alice, 300e18);
+        uint256 bag = token.balanceOf(alice);
+        vm.prank(alice);
+        token.transfer(address(imd), bag);
+        assertGe(token.balanceOf(address(imd)), engine.minBalance(), "a registerable bag sits at the IMD contract");
+
+        address[] memory one = new address[](1);
+        one[0] = address(imd);
+        engine.register(one);
+        assertEq(engine.holderCount(), 0, "the IMD address did not register");
+        assertTrue(engine.excluded(address(imd)), "the IMD address is excluded at bind");
+    }
+
     // ------------------------------------------------------------------ the liquidity lock
     /// Audit finding, MEDIUM, found by three specialists: the single permitted add went to whoever was
     /// first, so one wei from a stranger consumed it and the factory's real seed reverted.

@@ -217,7 +217,14 @@ contract PimdEngine is ReentrancyGuard {
         hook = IPimdHookLike(hook_);
         lastFire = block.timestamp;
 
-        address[6] memory ex = [hook_, address(poolManager), address(this), team, address(0), DEAD];
+        // `token_` and `imd` are in here for the same reason as the distributor above: neither can forward an
+        // IMD payout, and anyone can set either up with a single transfer. PIMD sent to its own address is
+        // stuck there for good -- PimdToken has no logic that moves a balance and nobody holds its key -- so
+        // without this the token address could be registered on that stuck bag and would strand a share of
+        // every later drip. `prune` could not undo it either: it only drops holders whose bag has fallen
+        // below the minimum, and that one never falls.
+        address[8] memory ex =
+            [token_, address(imd), hook_, address(poolManager), address(this), team, address(0), DEAD];
         for (uint256 i; i < ex.length; ++i) {
             excluded[ex[i]] = true;
         }
