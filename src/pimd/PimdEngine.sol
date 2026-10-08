@@ -20,6 +20,7 @@ interface IPimdHookLike {
     function quote() external view returns (address);
     function token() external view returns (address);
     function poolManager() external view returns (address);
+    function launchFactory() external view returns (address);
 }
 
 interface IPairLike {
@@ -59,6 +60,11 @@ contract PimdEngine is ReentrancyGuard {
     uint256 internal constant WAD = 1e18;
     uint256 internal constant SEND_GAS = 60_000;
     uint256 internal constant PROBE_GAS = 30_000;
+    /// How many entries `register` will look at to find a dead slot when the set is full. Bounded so the
+    /// cost of a reclaim is predictable; the cursor makes the sweep amortised across calls.
+    uint256 internal constant RECLAIM_PROBES = 8;
+    /// Addresses below this are precompiles. None of them can forward an IMD payout.
+    uint160 internal constant PRECOMPILE_CEILING = 0x100;
     uint256 internal constant TIP_BUDGET_BPS = 500; // keeper tips never exceed 5% of an epoch's drip
     /// @dev How long an epoch may stay open before anyone may abandon it. The engine has no owner, so this
     /// is the only thing standing between an epoch that cannot finish and an engine that never pays again.
@@ -86,7 +92,7 @@ contract PimdEngine is ReentrancyGuard {
     /// this is what keeps that call inside a block's gas. It is a deploy parameter rather than a constant
     /// because the number that matters is a measured gas cost on a specific chain, and getting it wrong in
     /// either direction is bad: too high and an epoch can become unweighable, too low and honest holders
-    /// are turned away. See `GAS.md` for the measurement behind the launch value.
+    /// are turned away. The launch value is measured by `test_epoch_gas_for_100_holders` in test/pimd/Gas.t.sol.
     uint256 public immutable maxHolders;
 
     struct Config {
@@ -142,6 +148,7 @@ contract PimdEngine is ReentrancyGuard {
     uint256 public epoch;
     uint256 public lastFire;
     uint256 public cursor;
+    uint256 public reclaimCursor; // where the next `register` reclaim sweep starts
     uint256 public epochCount; // holders snapshot for the running epoch
     uint256 public totalWeight;
     uint256 internal epochPaidHolders;
@@ -179,7 +186,12 @@ contract PimdEngine is ReentrancyGuard {
         if (c.maxCatchup < PERIOD || c.maxCatchup > 7 days) revert BadConfig();
         // An upper bound on the bound itself: past this the whole-set tally cannot fit in a block on any
         // chain we would launch on, so a config that allowed it would be reintroducing the brick.
-        if (c.maxHolders == 0 || c.maxHolders > 5_000) revert BadConfig();
+        // 900 is a hard ceiling, not a preference: `tally` weighs the whole set in one transaction and
+        // costs about 34.6k gas a weighted holder, so 900 is 31.1M against the 32M ArbOS per-transaction
+        // limit this chain enforces (ArbGasInfo at 0x6C, getGasAccountingParams, returns a 32,000,000
+        // maxTxGasLimit). Above that an epoch cannot be weighed at all, and with no owner there would be
+        // no way to lower the bound afterwards. Audit finding 7.
+        if (c.maxHolders == 0 || c.maxHolders > 900) revert BadConfig();
         poolManager = IPoolManager(c.poolManager);
         imd = IERC20Min(c.imd);
         team = c.team;
@@ -224,8 +236,20 @@ contract PimdEngine is ReentrancyGuard {
         // without this the token address could be registered on that stuck bag and would strand a share of
         // every later drip. `prune` could not undo it either: it only drops holders whose bag has fallen
         // below the minimum, and that one never falls.
-        address[8] memory ex =
-            [token_, address(imd), hook_, address(poolManager), address(this), team, address(0), DEAD];
+        // The launch factory is in here because the hook already names it and it owns the only liquidity
+        // position, so the pool's own fee accrues to it in PIMD: left out, anyone could register it and
+        // strand a share of every drip in a contract that cannot forward IMD. Audit finding 3.
+        address[9] memory ex = [
+            token_,
+            address(imd),
+            hook_,
+            h.launchFactory(),
+            address(poolManager),
+            address(this),
+            team,
+            address(0),
+            DEAD
+        ];
         for (uint256 i; i < ex.length; ++i) {
             excluded[ex[i]] = true;
         }
@@ -258,12 +282,20 @@ contract PimdEngine is ReentrancyGuard {
         for (uint256 i; i < accounts.length; ++i) {
             address a = accounts[i];
             if (excluded[a] || _holder[a].index1 != 0) continue;
+            // Precompiles hold a balance like anything else and answer no probe, so without this a
+            // stranger could enrol one and strand its share of every drip at a keyless address.
+            if (uint160(a) < PRECOMPILE_CEILING) continue;
             uint256 bal = IERC20Min(token).balanceOf(a);
             if (bal < minBalance || _isPool(a)) continue;
             // The set is bounded because `tally` weighs all of it in one call. Refusing here rather than
             // letting the set grow past what can be weighed is the whole point: an over-large set used to
             // be unrecoverable, and registration is permissionless so anyone could cause it.
-            if (holders.length >= maxHolders) revert HolderSetFull(maxHolders);
+            // A slot used to be claimed on the balance of one instant and then held for ever, so one
+            // minimum bag walked through fresh addresses filled the set and locked everybody out of
+            // registering, permanently, with no owner to undo it. Audit finding 2. A full set now gives
+            // up a slot held by an entry that no longer qualifies, which makes padding a cost the
+            // attacker has to keep paying rather than a thing they buy once.
+            if (holders.length >= maxHolders && !_reclaimSlot()) revert HolderSetFull(maxHolders);
             holders.push(a);
             Holder storage h = _holder[a];
             h.index1 = uint32(holders.length);
@@ -298,12 +330,7 @@ contract PimdEngine is ReentrancyGuard {
             // its own. The probe is paid for by whoever calls `prune`, exactly as it is at `register`, and it
             // reads only the address being pruned, so it cannot be aimed at anybody else.
             if (IERC20Min(token).balanceOf(a) >= minBalance && !_shapeChanged(a, _holder[a]) && !_isPool(a)) continue;
-            address last = holders[holders.length - 1];
-            holders[idx1 - 1] = last;
-            _holder[last].index1 = uint32(idx1);
-            holders.pop();
-            delete _holder[a];
-            emit Pruned(a);
+            _removeAt(idx1 - 1, a);
         }
     }
 
@@ -607,6 +634,41 @@ contract PimdEngine is ReentrancyGuard {
             pot += amt;
             tipBudget = budget;
         }
+    }
+
+    /// Swap-and-pop one entry out of the holder set. Callers must have checked that the entry may go and
+    /// that no epoch is mid-flight: both `tally` and `pay` walk `holders` against the `epochCount` taken at
+    /// `fire`, so shortening it under them was the brick that C2 was about.
+    function _removeAt(uint256 idx0, address a) internal {
+        address last = holders[holders.length - 1];
+        holders[idx0] = last;
+        _holder[last].index1 = uint32(idx0 + 1);
+        holders.pop();
+        delete _holder[a];
+        emit Pruned(a);
+    }
+
+    /// Frees one slot held by an entry that would be prunable anyway: its bag has fallen below the minimum,
+    /// or code arrived where `register` vetted none. Only between epochs, for the reason on `_removeAt`,
+    /// and it looks at a bounded number of entries so the gas a reclaim costs cannot be made to grow. The
+    /// cursor persists, so repeated calls sweep the set rather than re-reading the same head every time.
+    function _reclaimSlot() internal returns (bool) {
+        if (phase != Phase.Idle) return false;
+        uint256 n = holders.length;
+        if (n == 0) return false;
+        uint256 c = reclaimCursor;
+        for (uint256 k; k < RECLAIM_PROBES; ++k) {
+            if (c >= n) c = 0;
+            address a = holders[c];
+            if (IERC20Min(token).balanceOf(a) < minBalance || _shapeChanged(a, _holder[a])) {
+                reclaimCursor = c;
+                _removeAt(c, a);
+                return true;
+            }
+            ++c;
+        }
+        reclaimCursor = c;
+        return false;
     }
 
     /// True when an address no longer has the shape `register` vetted: it had no code then and has code now.

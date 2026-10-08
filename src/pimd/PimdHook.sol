@@ -90,7 +90,7 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// getters purely so tests can point them at local doubles; the production path returns these constants.
     address internal constant TEAM_WALLET = 0x0960E8Bd80462e3842Bb6620c7C5289A44c4559B;
     /// @dev The engine is deployed by us before the launch request goes out, and its address written here.
-    address internal constant ENGINE_ADDRESS = 0x8974d07239e6D8B843eE70725823E7e95CbB6924;
+    address internal constant ENGINE_ADDRESS = 0x35337318F15d644771a044E5A5cC09f48ecc6de0;
     /// @dev IMD on Robinhood Chain. Every fee calculation, the ERC-6909 claim id and the engine's booking all
     /// assume the quote is this token specifically, so the pool is refused if it is anything else.
     address internal constant QUOTE_TOKEN = 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127;
@@ -433,7 +433,11 @@ contract PimdHook is IHooks, IUnlockCallback {
         // cap a bot flushing after every small trade took the whole team slice: below 1.667 IMD of buys
         // or 0.714 IMD of sells the flat tip exceeded the team's cut, so `toTeam - tip` was zero every
         // time. The team now always keeps the large majority of its slice, whatever the trade size.
-        uint256 tip = callerTip;
+        // The engine calls this on its own income path, and whatever it is paid it books as holder
+        // income. Tipping it would therefore move the tip out of the team's slice and into the holders'
+        // pot on every fire, while `totalToTeam` still recorded it as paid to the team. The fire keeper is
+        // already paid from the engine's own tip budget, so no one needed that payment.
+        uint256 tip = msg.sender == engine() ? 0 : callerTip;
         uint256 cap = (toTeam * TIP_MAX_BPS) / BPS;
         if (tip > cap) tip = cap;
         holdersOwed = 0;

@@ -381,7 +381,7 @@ abstract contract PimdBaseTest is Test {
     /// The holder-set bound the engine under test is deployed with. Overridden by the test that proves the
     /// bound is enforced, so it can reach it in three registrations instead of twelve hundred.
     function _maxHolders() internal view virtual returns (uint256) {
-        return 1_200;
+        return 800;
     }
 
     // ---- engine helpers ----

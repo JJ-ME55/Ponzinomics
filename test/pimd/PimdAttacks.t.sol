@@ -384,7 +384,7 @@ contract PimdAttacksTest is PimdBaseTest {
                 fireTip: 0.01e18,
                 tipPerHolder: 0.0001e18,
                 maxCatchup: 6 hours,
-                maxHolders: 1_200
+                maxHolders: 800
             })
         );
 

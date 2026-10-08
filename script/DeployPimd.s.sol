@@ -56,12 +56,13 @@ contract DeployPimd is Script {
             fireTip: vm.envOr("FIRE_TIP", production ? uint256(0.05e18) : uint256(0.01e18)),
             tipPerHolder: vm.envOr("TIP_PER_HOLDER", production ? uint256(0.003e18) : uint256(0.0001e18)),
             maxCatchup: vm.envOr("MAX_CATCHUP", production ? uint256(6 hours) : uint256(1 hours)),
-            // `tally` weighs the whole holder set in one call, so the set is bounded. 1,200 against a
-            // measured 34.6k gas per holder is about 42M, which Robinhood Chain takes without noticing
-            // (its block limit is 2^50), and `register` refuses past it rather than letting an epoch
-            // become unweighable. The minimum bag is a tenth of a percent of supply, so at most 1,000
-            // addresses can qualify at once and this cap is never the thing that binds.
-            maxHolders: vm.envOr("MAX_HOLDERS", uint256(1_200))
+            // `tally` weighs the whole holder set in one call, so the set has to fit one transaction.
+            // The budget is NOT the 2^50 in the block header -- that is an Arbitrum placeholder. It is
+            // ArbOS's maxTxGasLimit, which this chain's ArbGasInfo precompile (0x6C,
+            // getGasAccountingParams) reports as 32,000,000. At a measured 34.6k gas a weighted holder,
+            // 800 is 27.7M, 86% of the budget, which leaves room for a gas-schedule change we cannot
+            // amend for. 1,200 was 41.5M and could not have been weighed at all. Audit finding 7.
+            maxHolders: vm.envOr("MAX_HOLDERS", uint256(800))
         });
 
         vm.broadcast(pk);

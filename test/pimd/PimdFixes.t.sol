@@ -153,6 +153,121 @@ contract PimdFixesTest is PimdBaseTest {
         engine.register(one);
     }
 
+    // ================================================================= audit over 0fc1ff2
+    /// Finding 1, medium. `fire` pulls the hook through `flush`, which pays a caller tip out of the team's
+    /// slice to msg.sender -- and on that path msg.sender is the engine, which books whatever it receives
+    /// as holder income. So every fire quietly moved up to 20% of the team's accrued slice into the
+    /// holders' pot, while the hook's `totalToTeam` still recorded it as paid to the team.
+    function test_fire_does_not_tip_the_engine_out_of_the_team_slice() public {
+        _pastLaunchCap();
+        _buy(carol, 300e18);
+        _register(carol);
+        _buy(alice, 1e18);
+
+        uint256 owedTeam = hook.teamOwed();
+        uint256 owedHolders = hook.holdersOwed();
+        assertGt(owedTeam, 0, "the team is owed something");
+        uint256 teamBefore = imd.balanceOf(team);
+
+        vm.warp(vm.getBlockTimestamp() + 2 hours);
+        vm.prank(keeper);
+        engine.fire();
+
+        assertEq(imd.balanceOf(team) - teamBefore, owedTeam, "the team did not receive its whole slice");
+        assertEq(engine.totalIncome(), owedHolders, "and nothing extra was booked as holder income");
+        assertEq(hook.totalToTeam(), owedTeam, "stats agree with the balance");
+    }
+
+    /// Finding 2, medium. A slot was claimed on the balance of one instant and then held for ever, so one
+    /// minimum bag walked through fresh addresses filled the set and locked everybody out of registering,
+    /// permanently, with no owner to undo it. A full set now gives up a slot held by an entry that no
+    /// longer qualifies, so padding is a cost the attacker keeps paying rather than one they pay once.
+    function test_a_walked_bag_cannot_lock_the_holder_set_for_ever() public {
+        _pastLaunchCap();
+        _buy(alice, 300e18);
+        uint256 bag = token.balanceOf(alice);
+
+        // the attacker walks one bag through fresh addresses, registering each while it holds it
+        address[] memory ghosts = new address[](3); // _maxHolders() is 3 here
+        address prev = alice;
+        for (uint256 i; i < 3; ++i) {
+            ghosts[i] = address(uint160(0xDEAD00 + i));
+            vm.prank(prev);
+            token.transfer(ghosts[i], bag);
+            _register(ghosts[i]);
+            prev = ghosts[i];
+        }
+        assertEq(engine.holderCount(), 3, "the set is full of ghosts");
+        assertLt(token.balanceOf(ghosts[0]), engine.minBalance(), "and the first one is empty");
+
+        // an honest holder with a real bag can still get in, by reclaiming a dead slot
+        address honest = makeAddr("honest");
+        vm.prank(prev);
+        token.transfer(honest, bag);
+        _register(honest);
+        (bool registered,,,,) = engine.holderInfo(honest);
+        assertTrue(registered, "the honest holder got a slot");
+        assertEq(engine.holderCount(), 3, "and the set is still bounded");
+    }
+
+    /// Finding 3, medium. The launch factory owns the only liquidity position, so the pool's own 1.25% fee
+    /// accrues to it in PIMD. Left out of the exclusion list, anyone could register it and strand a share
+    /// of every drip in a contract that cannot forward IMD, with prune unable to touch it.
+    function test_the_launch_factory_and_precompiles_can_never_register() public {
+        _pastLaunchCap();
+        address fac = hook.launchFactory();
+        assertTrue(engine.excluded(fac), "the launch factory is excluded at bind");
+
+        _buy(alice, 300e18);
+        uint256 bag = token.balanceOf(alice);
+        vm.prank(alice);
+        token.transfer(fac, bag);
+        _register(fac);
+        (bool facReg,,,,) = engine.holderInfo(fac);
+        assertFalse(facReg, "the factory did not register");
+
+        // and a precompile, which answers no probe and can forward nothing, is refused on its own account
+        address pre = address(uint160(1));
+        vm.prank(fac);
+        token.transfer(pre, bag);
+        assertGe(token.balanceOf(pre), engine.minBalance(), "the precompile holds a registerable bag");
+        _register(pre);
+        (bool preReg,,,,) = engine.holderInfo(pre);
+        assertFalse(preReg, "the precompile did not register");
+        assertEq(engine.holderCount(), 0, "nothing got in");
+    }
+
+    /// Finding 7, low. maxHolders exists so the whole-set tally fits one transaction. The budget is not the
+    /// 2^50 in the block header, which is an Arbitrum placeholder, but ArbOS's maxTxGasLimit: 32,000,000 on
+    /// this chain. At the measured cost a bound of 1,200 could never have been weighed.
+    function test_the_holder_bound_fits_the_chains_per_transaction_budget() public {
+        uint256 ARBOS_MAX_TX_GAS = 32_000_000;
+        uint256 measuredPerHolder = 34_576; // test/pimd/Gas.t.sol, first-page worst case
+
+        vm.expectRevert(PimdEngine.BadConfig.selector);
+        new PimdEngine(_cfg(901));
+        PimdEngine ok = new PimdEngine(_cfg(900));
+        assertEq(ok.maxHolders(), 900, "900 is the hard ceiling");
+        assertLt(900 * measuredPerHolder, ARBOS_MAX_TX_GAS, "the ceiling is weighable");
+        assertGt(1_200 * measuredPerHolder, ARBOS_MAX_TX_GAS, "the old launch value was not");
+    }
+
+    function _cfg(uint256 maxHolders_) internal view returns (PimdEngine.Config memory) {
+        return PimdEngine.Config({
+            poolManager: address(manager),
+            imd: address(imd),
+            team: team,
+            binder: address(this),
+            dripBpsPerPeriod: 400,
+            minInterval: 2 minutes,
+            minBalance: 100_000e18,
+            fireTip: 0.01e18,
+            tipPerHolder: 0.0001e18,
+            maxCatchup: 6 hours,
+            maxHolders: maxHolders_
+        });
+    }
+
     function _maxHolders() internal view override returns (uint256) {
         return 3;
     }
@@ -362,7 +477,7 @@ contract PimdFixesTest is PimdBaseTest {
                 fireTip: 0.01e18,
                 tipPerHolder: 0.0001e18,
                 maxCatchup: 6 hours,
-                maxHolders: 1_200
+                maxHolders: 800
             })
         );
         // the live hook names the engine from setUp, so this one cannot bind to it at all
