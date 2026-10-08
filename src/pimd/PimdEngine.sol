@@ -14,9 +14,11 @@ interface IERC20Min {
 
 interface IPimdHookLike {
     function flush() external returns (uint256, uint256);
+    function flushHolders() external returns (uint256);
     function holdersOwed() external view returns (uint256);
     function engine() external view returns (address);
     function quote() external view returns (address);
+    function token() external view returns (address);
     function poolManager() external view returns (address);
 }
 
@@ -58,6 +60,9 @@ contract PimdEngine is ReentrancyGuard {
     uint256 internal constant SEND_GAS = 60_000;
     uint256 internal constant PROBE_GAS = 30_000;
     uint256 internal constant TIP_BUDGET_BPS = 500; // keeper tips never exceed 5% of an epoch's drip
+    /// @dev How long an epoch may stay open before anyone may abandon it. The engine has no owner, so this
+    /// is the only thing standing between an epoch that cannot finish and an engine that never pays again.
+    uint256 internal constant ABORT_DELAY = 1 days;
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
     /// @dev bytes32(uint256(keccak256("Unlocked")) - 1), the PoolManager's transient unlock flag.
     bytes32 internal constant IS_UNLOCKED_SLOT = 0xc090fc4683624cfc3884e9d8de5eca132f2d0ec062aff75d43c0465d5ceeab23;
@@ -77,6 +82,12 @@ contract PimdEngine is ReentrancyGuard {
     /// moment it restarted. Set it to roughly the intended epoch cadence: too low and a slow cadence can never
     /// release the pot, too high and a gap becomes a payday.
     uint256 public immutable maxCatchup;
+    /// @notice The largest the registered holder set may grow. `tally` weighs the whole set in one call, so
+    /// this is what keeps that call inside a block's gas. It is a deploy parameter rather than a constant
+    /// because the number that matters is a measured gas cost on a specific chain, and getting it wrong in
+    /// either direction is bad: too high and an epoch can become unweighable, too low and honest holders
+    /// are turned away. See `GAS.md` for the measurement behind the launch value.
+    uint256 public immutable maxHolders;
 
     struct Config {
         address poolManager;
@@ -89,6 +100,7 @@ contract PimdEngine is ReentrancyGuard {
         uint256 fireTip;
         uint256 tipPerHolder;
         uint256 maxCatchup;
+        uint256 maxHolders;
     }
 
     // ------------------------------------------------------------------ bound state
@@ -142,6 +154,7 @@ contract PimdEngine is ReentrancyGuard {
     event Income(uint256 amount);
     event Fired(uint256 indexed epoch, uint256 imdForHolders, uint256 holderCount);
     event EpochPaid(uint256 indexed epoch, uint256 imdPaid, uint256 holdersPaid);
+    event EpochAborted(uint256 indexed epoch, uint256 imdReturned);
     event PayoutFailed(address indexed holder, uint256 amount);
     event Registered(address indexed holder);
     event Pruned(address indexed holder);
@@ -152,6 +165,7 @@ contract PimdEngine is ReentrancyGuard {
     error NotBound();
     error WrongPhase();
     error TallyMustBeWhole(uint256 holders);
+    error HolderSetFull(uint256 max);
     error TooSoon();
     error BadConfig();
     error PoolUnlocked();
@@ -162,6 +176,9 @@ contract PimdEngine is ReentrancyGuard {
         }
         if (c.dripBpsPerPeriod == 0 || c.dripBpsPerPeriod > 5_000) revert BadConfig();
         if (c.maxCatchup < PERIOD || c.maxCatchup > 7 days) revert BadConfig();
+        // An upper bound on the bound itself: past this the whole-set tally cannot fit in a block on any
+        // chain we would launch on, so a config that allowed it would be reintroducing the brick.
+        if (c.maxHolders == 0 || c.maxHolders > 5_000) revert BadConfig();
         poolManager = IPoolManager(c.poolManager);
         imd = IERC20Min(c.imd);
         team = c.team;
@@ -172,6 +189,7 @@ contract PimdEngine is ReentrancyGuard {
         fireTip = c.fireTip;
         tipPerHolder = c.tipPerHolder;
         maxCatchup = c.maxCatchup;
+        maxHolders = c.maxHolders;
     }
 
     // ================================================================== one-time setup
@@ -192,6 +210,7 @@ contract PimdEngine is ReentrancyGuard {
         IPimdHookLike h = IPimdHookLike(hook_);
         if (h.engine() != address(this)) revert BadConfig();
         if (h.quote() != address(imd)) revert BadConfig();
+        if (h.token() != token_) revert BadConfig();
         if (h.poolManager() != address(poolManager)) revert BadConfig();
         bound = true;
         token = token_;
@@ -222,13 +241,21 @@ contract PimdEngine is ReentrancyGuard {
     // ================================================================== holders
     /// @notice Registers addresses for drips. Anyone may call; addresses that are excluded, already registered,
     /// below the minimum bag, or pool-like contracts holding PIMD are skipped.
-    function register(address[] calldata accounts) external {
+    /// @dev Refuses to run while the PoolManager is unlocked, like every other state-changing entry point.
+    /// Registration reads `balanceOf` to set the opening `lastBal`, and inside an unlock a flash borrower can
+    /// stand in front of it holding the pool's entire PIMD balance.
+    function register(address[] calldata accounts) external nonReentrant {
         if (!bound) revert NotBound();
+        _requireLocked();
         for (uint256 i; i < accounts.length; ++i) {
             address a = accounts[i];
             if (excluded[a] || _holder[a].index1 != 0) continue;
             uint256 bal = IERC20Min(token).balanceOf(a);
             if (bal < minBalance || _isPool(a)) continue;
+            // The set is bounded because `tally` weighs all of it in one call. Refusing here rather than
+            // letting the set grow past what can be weighed is the whole point: an over-large set used to
+            // be unrecoverable, and registration is permissionless so anyone could cause it.
+            if (holders.length >= maxHolders) revert HolderSetFull(maxHolders);
             holders.push(a);
             Holder storage h = _holder[a];
             h.index1 = uint64(holders.length);
@@ -239,14 +266,14 @@ contract PimdEngine is ReentrancyGuard {
     }
 
     /// @notice Removes registered holders whose bag has fallen below the minimum, keeping the tally loop lean.
-    /// @dev Allowed while an epoch is waiting to be weighed as well as between epochs, and this matters:
-    /// weighing happens in one call, so a holder set too large for one block would otherwise leave the
-    /// epoch stuck in Tally with no way back, because the only thing that can shrink the set is this
-    /// function. Registration is permissionless and one bag can register many addresses, so without this
-    /// the engine could be bricked for the price of the gas to register them. It is refused during Pay,
-    /// where the weights are already fixed and moving an index would misallocate a payout.
-    function prune(address[] calldata accounts) external {
-        if (phase == Phase.Pay) revert WrongPhase();
+    /// @dev Only between epochs. It does swap-and-pop on `holders`, which moves indices, and both `tally` and
+    /// `pay` walk that array against the `epochCount` snapshot taken at `fire`. Allowing it mid-epoch was a
+    /// brick: one call shortened the array under a running tally, so the loop read past the end and reverted
+    /// for ever, with no phase left to escape to. Shrinking the set is no longer load-bearing either, because
+    /// weighing is paged again, so there is nothing to trade off here.
+    function prune(address[] calldata accounts) external nonReentrant {
+        if (phase != Phase.Idle) revert WrongPhase();
+        _requireLocked();
         for (uint256 i; i < accounts.length; ++i) {
             address a = accounts[i];
             uint256 idx1 = _holder[a].index1;
@@ -269,41 +296,67 @@ contract PimdEngine is ReentrancyGuard {
         if (block.timestamp < lastFire + minInterval) revert TooSoon();
         _requireLocked();
 
-        // Best effort: a hook-side problem may delay income but must never block a drip.
+        // Best effort: a hook-side problem may delay income but must never block a drip. Pull the holders'
+        // side on its own, because `flush` also pays the team and a team wallet that refuses IMD would
+        // otherwise take the whole drip down with it. `flush` stays as the fallback so the team's slice is
+        // still collected on the normal path.
         if (hook.holdersOwed() != 0) {
-            try hook.flush() {} catch {}
+            try hook.flush() {}
+            catch {
+                // The team's wallet is the only part of `flush` that can fail on someone else's say-so.
+                // Fall back to the holders-only path so a refused team transfer delays the team's slice
+                // rather than the drip. This is the hatch `flushHolders` was built for.
+                try hook.flushHolders() {} catch {}
+            }
         }
         _book();
 
         uint256 elapsed = block.timestamp - lastFire;
         uint256 drip = _released(pot, elapsed);
-        lastFire = block.timestamp;
-        tipBudget = (drip * TIP_BUDGET_BPS) / BPS;
 
         uint256 n = holders.length;
         emit Fired(epoch + 1, drip, n);
-        if (drip != 0 && n != 0) {
-            pot -= drip;
-            epochQuote = drip;
-            epoch += 1;
-            phase = Phase.Tally;
-            cursor = 0;
-            epochCount = n;
-            totalWeight = 0;
-            epochPaidHolders = 0;
-        }
+        // No drip or nobody to pay is not an epoch. Leave `lastFire` alone so the elapsed time is not
+        // forfeited, and pay no tip: there is no work here to reward, and paying for it let a caller
+        // drain the tip budget out of the pot by firing into an empty holder set.
+        if (drip == 0 || n == 0) return;
+
+        pot -= drip;
+        epochQuote = drip;
+        epoch += 1;
+        phase = Phase.Tally;
+        cursor = 0;
+        epochCount = n;
+        totalWeight = 0;
+        epochPaidHolders = 0;
+        lastFire = block.timestamp;
+        tipBudget = (drip * TIP_BUDGET_BPS) / BPS;
         _tip(fireTip);
     }
 
     /// @notice First pass: reads every registered holder's PIMD balance, updates the hold streak and records
     /// this epoch's weight. It must cover all of them in one call.
-    /// @dev Paging this is what let one bag be counted once per wallet it was moved through: weights are
-    /// read from live balances, so a page boundary is a window to transfer the bag and be weighed again.
-    /// With N wallets a sybil took N/(N+1) of the epoch out of the honest holders' share. Weighing the
-    /// whole set in a single call closes it, because nothing can move tokens in the middle of a loop.
-    /// `pay` stays paged: by then the weights are frozen and a transfer cannot change them.
-    /// The cost is a ceiling on holders per epoch, bounded by the block gas limit. `epochCount` and
-    /// `holderCount()` are public so the keeper can watch how close that ceiling is.
+    /// @dev Two defences here, and they are not interchangeable.
+    ///
+    /// Weighing the whole set in one call is what stops one bag being counted once per wallet it is moved
+    /// through. Paging cannot be made safe by any rule about balances, because the attacker chooses when
+    /// each slot is read relative to moving the bag, and every value available to the loop -- the live
+    /// balance and the balance recorded at the previous pass alike -- is downstream of a balance the
+    /// attacker shuttled. Only a loop nothing can interleave with closes it. The cost is a ceiling on the
+    /// holder set, which is why `maxHolders` exists and why `register` enforces it: an unbounded set with a
+    /// whole-set loop meant the first `fire` past the gas ceiling wedged the engine for ever.
+    ///
+    /// Weighing on the smaller of the current and previous balance is what stops borrowed weight, which the
+    /// PoolManager guard alone could not: that guard only sees Uniswap V4, so a flash loan from anywhere
+    /// else, or a one-block OTC loan, stood outside it. Under a whole-set loop each holder is read exactly
+    /// once, so a bag that was not already there at the previous tally carries no weight however large it
+    /// is. The deliberate cost: tokens must survive one epoch before they earn, so a fresh buy waits a
+    /// single epoch. Selling is unchanged and still restarts the streak immediately.
+    ///
+    /// `_isPool` is deliberately not called here. It staticcalls an address the holder controls, and a
+    /// contract that burns both probes cost about 58k gas per slot against 13.5k for a plain holder, which
+    /// let a handful of hostile registrations cut the achievable set by two thirds. The check belongs at
+    /// `register`, where the registrant pays for it and a pair cannot get in to begin with.
     function tally(uint256 maxHolders) external nonReentrant {
         if (phase != Phase.Tally) revert WrongPhase();
         _requireLocked();
@@ -323,9 +376,13 @@ contract PimdEngine is ReentrancyGuard {
                 // bought or received: blend by size, so fresh tokens never inherit an old streak
                 h.streakStart = uint64((last * h.streakStart + (bal - last) * nowTs) / bal);
             }
+            // Weigh on the balance that has actually survived an epoch here. `lastBal` is only written
+            // below, so a bag that arrived since the last tally -- bought, received, or borrowed for the
+            // length of one transaction -- cannot carry weight yet.
+            uint256 eff = bal < last ? bal : last;
             h.lastBal = uint128(bal);
             uint256 w;
-            if (bal >= minBalance && !_isPool(a)) w = (bal * tierBps(nowTs - h.streakStart)) / BPS;
+            if (eff >= minBalance) w = (eff * tierBps(nowTs - h.streakStart)) / BPS;
             h.weight = uint128(w);
             tw += w;
         }
@@ -391,6 +448,29 @@ contract PimdEngine is ReentrancyGuard {
             emit EpochPaid(epoch, epochPaidHolders == 0 ? 0 : total - leftover, epochPaidHolders);
         }
         _tip(tipPerHolder * (end - start));
+    }
+
+    /// @notice Abandons an epoch that has been open for a day without finishing. Permissionless, unpaid.
+    /// Whatever the epoch did not manage to pay returns to the pot and the engine goes back to Idle.
+    /// @dev This contract has no owner and cannot be upgraded, so without this there is no answer to an
+    /// epoch that cannot complete: `fire` and `pay` both refuse to run outside their phase, and an epoch
+    /// stuck in Tally or Pay would mean the engine never pays anybody again and every future drip
+    /// accumulates behind it. A day is long enough that it can never race an honest keeper, and the caller
+    /// is paid nothing so there is no incentive to abandon a working epoch. Holders already paid keep
+    /// what they received; `epochPaidQuote` is what makes the arithmetic here exact.
+    function abortEpoch() external nonReentrant {
+        if (phase == Phase.Idle) revert WrongPhase();
+        if (block.timestamp < lastFire + ABORT_DELAY) revert TooSoon();
+        uint256 unpaid = epochQuote - epochPaidQuote;
+        pot += unpaid;
+        epochQuote = 0;
+        epochPaidQuote = 0;
+        epochPaidHolders = 0;
+        totalWeight = 0;
+        cursor = 0;
+        phase = Phase.Idle;
+        lastFire = block.timestamp;
+        emit EpochAborted(epoch, unpaid);
     }
 
     // ================================================================== views

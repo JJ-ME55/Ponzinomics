@@ -30,12 +30,18 @@ contract DeployPimd is Script {
         address binder = vm.envOr("BINDER", team);
         require(team != address(0) && binder != address(0), "team and binder required");
 
-        bool mainnet = block.chainid == 1;
-        bool robinhood = block.chainid == 4663 || block.chainid == 46630;
-        require(mainnet || robinhood, "unsupported chain");
+        // Which chain's addresses to use, and whether this is a real launch, are two different questions.
+        // Conflating them is how the engine already on Robinhood ended up with every economic parameter set
+        // to its test value: the flag was `block.chainid == 1`, which is Ethereum, but it also chose the
+        // economics, and Robinhood mainnet is not Ethereum. `production` is the one that picks numbers.
+        bool ethereum = block.chainid == 1;
+        bool robinhoodMainnet = block.chainid == 4663;
+        bool testnet = block.chainid == 46630;
+        require(ethereum || robinhoodMainnet || testnet, "unsupported chain");
+        bool production = !testnet;
 
-        address pm = vm.envOr("POOL_MANAGER", mainnet ? MAINNET_POOL_MANAGER : ROBINHOOD_POOL_MANAGER);
-        address imd = vm.envOr("IMD", mainnet ? MAINNET_IMD : ROBINHOOD_IMD);
+        address pm = vm.envOr("POOL_MANAGER", ethereum ? MAINNET_POOL_MANAGER : ROBINHOOD_POOL_MANAGER);
+        address imd = vm.envOr("IMD", ethereum ? MAINNET_IMD : ROBINHOOD_IMD);
         require(pm.code.length > 0, "PoolManager has no code");
         require(imd.code.length > 0, "IMD has no code");
 
@@ -44,12 +50,16 @@ contract DeployPimd is Script {
             imd: imd,
             team: team,
             binder: binder,
-            dripBpsPerPeriod: vm.envOr("DRIP_BPS", mainnet ? uint256(150) : uint256(400)),
+            dripBpsPerPeriod: vm.envOr("DRIP_BPS", production ? uint256(150) : uint256(400)),
             minInterval: vm.envOr("MIN_INTERVAL", uint256(2 minutes)),
-            minBalance: vm.envOr("MIN_BALANCE", mainnet ? uint256(1_000_000e18) : uint256(100_000e18)),
-            fireTip: vm.envOr("FIRE_TIP", mainnet ? uint256(0.05e18) : uint256(0.01e18)),
-            tipPerHolder: vm.envOr("TIP_PER_HOLDER", mainnet ? uint256(0.003e18) : uint256(0.0001e18)),
-            maxCatchup: vm.envOr("MAX_CATCHUP", mainnet ? uint256(6 hours) : uint256(1 hours))
+            minBalance: vm.envOr("MIN_BALANCE", production ? uint256(1_000_000e18) : uint256(100_000e18)),
+            fireTip: vm.envOr("FIRE_TIP", production ? uint256(0.05e18) : uint256(0.01e18)),
+            tipPerHolder: vm.envOr("TIP_PER_HOLDER", production ? uint256(0.003e18) : uint256(0.0001e18)),
+            maxCatchup: vm.envOr("MAX_CATCHUP", production ? uint256(6 hours) : uint256(1 hours)),
+            // `tally` weighs the whole holder set in one call, so the set is bounded. 1,200 against a
+            // measured 13.5k gas per holder is about 16M, comfortably inside a single transaction, and
+            // `register` refuses past it rather than letting an epoch become unweighable.
+            maxHolders: vm.envOr("MAX_HOLDERS", uint256(1_200))
         });
 
         vm.broadcast(pk);
@@ -58,9 +68,25 @@ contract DeployPimd is Script {
         require(engine.team() == team && engine.binder() == binder, "engine wiring wrong");
         require(!engine.bound(), "engine should not be bound yet");
 
+        // This script has already been broadcast twice and two engines are live. The hook names exactly one
+        // of them in a compile-time constant, so a further deploy that nobody notices leaves the hook
+        // pointing at an engine that will never be bound, and the launch is paid for before anyone finds
+        // out. Set EXPECT_ENGINE to the address you intend and the script refuses to drift from it.
+        address expected = vm.envOr("EXPECT_ENGINE", address(0));
+        require(expected == address(0) || expected == address(engine), "engine address is not the expected one");
+
         console2.log("PimdEngine  ", address(engine));
         console2.log("team        ", team);
         console2.log("binder      ", binder);
+        console2.log("");
+        console2.log("-- parameters actually deployed (check these against intent) --");
+        console2.log("production  ", production);
+        console2.log("dripBps     ", engine.dripBpsPerPeriod());
+        console2.log("minBalance  ", engine.minBalance());
+        console2.log("fireTip     ", engine.fireTip());
+        console2.log("tipPerHolder", engine.tipPerHolder());
+        console2.log("maxCatchup  ", engine.maxCatchup());
+        console2.log("maxHolders  ", engine.maxHolders());
         console2.log("");
         console2.log("Next: write this address into PimdHook.ENGINE_ADDRESS, push, then quote the launch.");
         console2.log("After the launch lands, the binder calls engine.bind(token, hook, [distributor]).");

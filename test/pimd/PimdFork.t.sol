@@ -87,7 +87,8 @@ contract PimdForkTest is Test {
                 minBalance: 100_000e18,
                 fireTip: 0.01e18,
                 tipPerHolder: 0.0001e18,
-                maxCatchup: 6 hours
+                maxCatchup: 6 hours,
+                maxHolders: 1_200
             })
         );
 

@@ -11,6 +11,9 @@ optimizer_runs = 44444444
 via_ir = true
 # A launch compares deployed bytes against a local build, so the metadata hash must not be in them.
 bytecode_hash = "none"
+# bytecode_hash alone still leaves the CBOR metadata trailer in the artifact, which ends with the solc
+# version and so differs between builds. Drop it too, or a byte-for-byte verification can still miss.
+cbor_metadata = false
 # No fs_permissions and no ffi: the launch sandbox refuses to run a build whose config reaches outside
 # the build output, and nothing here needs either.
 

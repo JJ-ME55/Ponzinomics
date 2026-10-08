@@ -12,6 +12,7 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -48,19 +49,27 @@ contract MockLaunchFactory is IUnlockCallback {
     }
 
     function seed(PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity) external {
-        manager.unlock(abi.encode(key, tickLower, tickUpper, liquidity));
+        manager.unlock(abi.encode(key, tickLower, tickUpper, int256(uint256(liquidity))));
+    }
+
+    /// Tries to take the position back out. The factory is the only address that owns one, so this is the
+    /// only way to ask the real question the liquidity lock exists to answer: can the holder of the LP
+    /// withdraw it? Driving a negative delta through a test router instead proves nothing, because that
+    /// router owns no position and the PoolManager rejects it before the hook is ever consulted.
+    function unseed(PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity) external {
+        manager.unlock(abi.encode(key, tickLower, tickUpper, -int256(uint256(liquidity))));
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(manager), "only manager");
-        (PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity) =
-            abi.decode(data, (PoolKey, int24, int24, uint128));
+        (PoolKey memory key, int24 tickLower, int24 tickUpper, int256 liquidityDelta) =
+            abi.decode(data, (PoolKey, int24, int24, int256));
         (BalanceDelta d,) = manager.modifyLiquidity(
             key,
             ModifyLiquidityParams({
                 tickLower: tickLower,
                 tickUpper: tickUpper,
-                liquidityDelta: int256(uint256(liquidity)),
+                liquidityDelta: liquidityDelta,
                 salt: 0
             }),
             ""
@@ -197,7 +206,8 @@ abstract contract PimdBaseTest is Test {
                 minBalance: 100_000e18, // 0.01% of supply
                 fireTip: 0.02e18, // IMD
                 tipPerHolder: 0.0005e18,
-                maxCatchup: 6 hours
+                maxCatchup: 6 hours,
+                maxHolders: _maxHolders()
             })
         );
 
@@ -340,6 +350,38 @@ abstract contract PimdBaseTest is Test {
             ""
         );
         spent = before - token.balanceOf(who);
+    }
+
+    /// Expects a revert that came out of the hook itself. V4 catches a reverting hook callback and rethrows
+    /// it as `Hooks.WrappedError`, so a test that names the hook's own error directly never matches, and a
+    /// bare `vm.expectRevert()` matches anything at all, including the token allowance failures that made
+    /// four of these tests meaningless. This pins both the callback the call reached and the reason it gave.
+    function _expectHookRevert(address hookAddr, bytes4 callback, bytes4 err) internal {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                hookAddr,
+                callback,
+                abi.encodeWithSelector(err),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+    }
+
+    /// Funds this contract and lets the liquidity router pull from it. Without this, any `modifyLiquidity`
+    /// driven through `lpRouter` reverts while settling the tokens it does not have, which looks exactly
+    /// like the hook refusing the call. Four of the liquidity tests passed on that confusion.
+    function _armRouter(address pimd) internal {
+        deal(pimd, address(this), 1_000_000_000e18);
+        imd.mint(address(this), 1_000_000e18);
+        ERC20(pimd).approve(address(lpRouter), type(uint256).max);
+        imd.approve(address(lpRouter), type(uint256).max);
+    }
+
+    /// The holder-set bound the engine under test is deployed with. Overridden by the test that proves the
+    /// bound is enforced, so it can reach it in three registrations instead of twelve hundred.
+    function _maxHolders() internal view virtual returns (uint256) {
+        return 1_200;
     }
 
     // ---- engine helpers ----

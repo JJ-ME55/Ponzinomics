@@ -103,6 +103,9 @@ contract PimdHook is IHooks, IUnlockCallback {
     uint32 public constant launchCapBlocks = 6_000;
     uint128 public constant launchBuyCap = 25e18; // IMD one tx.origin may spend in the launch window
     uint128 public constant callerTip = 0.01e18; // paid to whoever calls flush, out of the team's slice only
+    /// @notice The most of the team's slice one flush may pay the caller, in bps. Keeps the flat `callerTip`
+    /// from swallowing the whole slice when little has accrued since the last flush.
+    uint256 public constant TIP_MAX_BPS = 2_000; // 20%
 
     // ------------------------------------------------------------------ immutables
     IPoolManager public immutable poolManager;
@@ -429,8 +432,13 @@ contract PimdHook is IHooks, IUnlockCallback {
         toHolders = holdersOwed;
         toTeam = teamOwed;
         if (toHolders == 0 && toTeam == 0) revert NothingPending();
+        // The tip is capped both absolutely and as a share of what the team is owed. Without the second
+        // cap a bot flushing after every small trade took the whole team slice: below 1.667 IMD of buys
+        // or 0.714 IMD of sells the flat tip exceeded the team's cut, so `toTeam - tip` was zero every
+        // time. The team now always keeps the large majority of its slice, whatever the trade size.
         uint256 tip = callerTip;
-        if (tip > toTeam) tip = toTeam;
+        uint256 cap = (toTeam * TIP_MAX_BPS) / BPS;
+        if (tip > cap) tip = cap;
         holdersOwed = 0;
         teamOwed = 0;
 

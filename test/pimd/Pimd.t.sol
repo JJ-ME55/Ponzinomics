@@ -389,23 +389,33 @@ contract PimdTest is PimdBaseTest {
     // ------------------------------------------------------------------ the liquidity lock
     /// Audit finding, MEDIUM, found by three specialists: the single permitted add went to whoever was
     /// first, so one wei from a stranger consumed it and the factory's real seed reverted.
+    /// @dev These four tests all used a bare `vm.expectRevert()` and drove the call through `lpRouter`,
+    /// which holds no PIMD and owns no position. The review showed every one of them passed for a reason
+    /// that had nothing to do with the hook: two reverted on the missing token allowance, one on V4's own
+    /// `CannotUpdateEmptyPosition`, and the fourth asserted nothing at all. All four were still green with
+    /// `beforeAddLiquidity` and `beforeRemoveLiquidity` deleted outright. They are now funded, approved,
+    /// and pinned to the hook's own errors, so they fail if the lock is removed.
     function test_a_stranger_cannot_squat_the_seed() public {
         (PimdHook fresh, PimdToken t) = _freshHook();
         PoolKey memory k = _keyFor(fresh, t, 12_500);
         vm.prank(address(factory));
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
         assertFalse(fresh.seeded(), "not seeded yet");
-        vm.expectRevert();
+
+        _armRouter(address(t));
+        _expectHookRevert(address(fresh), IHooks.beforeAddLiquidity.selector, PimdHook.NotLaunchFactory.selector);
         lpRouter.modifyLiquidity(
             k,
-            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: 1, salt: 0}),
+            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: 1e12, salt: 0}),
             ""
         );
         assertFalse(fresh.seeded(), "the seed slot is still the factory's");
     }
 
     function test_a_second_liquidity_add_is_refused() public {
-        vm.expectRevert();
+        assertTrue(hook.seeded(), "the factory's seed is in");
+        _armRouter(address(token));
+        _expectHookRevert(address(hook), IHooks.beforeAddLiquidity.selector, PimdHook.NotLaunchFactory.selector);
         lpRouter.modifyLiquidity(
             key,
             ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: 1e18, salt: 0}),
@@ -413,22 +423,49 @@ contract PimdTest is PimdBaseTest {
         );
     }
 
-    /// The whole reason the launch factory can hold the position safely: it can never move it.
-    function test_liquidity_can_never_be_removed() public {
-        vm.expectRevert();
-        lpRouter.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({tickLower: TICK_LOWER, tickUpper: START_TICK, liquidityDelta: -1, salt: 0}),
-            ""
-        );
+    /// The whole reason the launch factory can hold the position safely: it can never move it. The attempt
+    /// has to come from the factory, because it is the only address that owns a position to remove.
+    /// The one-shot seed guard, which no test reached before: every "second add" test was refused by the
+    /// factory pin first, so the `seeded` flag was never the thing doing the work. Only the factory can get
+    /// far enough to be told the seed is already spent.
+    function test_even_the_factory_gets_only_one_add() public {
+        assertTrue(hook.seeded(), "the one permitted add is spent");
+        _expectHookRevert(address(hook), IHooks.beforeAddLiquidity.selector, PimdHook.LiquidityIsLocked.selector);
+        factory.seed(key, TICK_LOWER, START_TICK, 1e12);
+    }
+
+    function test_liquidity_can_never_be_removed_even_by_its_owner() public {
+        assertTrue(hook.seeded(), "the factory's position is in the pool");
+        uint256 pimdBefore = token.balanceOf(address(factory));
+        uint256 imdBefore = imd.balanceOf(address(factory));
+
+        // one unit, and then the whole position: both refused, and refused by the hook
+        _expectHookRevert(address(hook), IHooks.beforeRemoveLiquidity.selector, PimdHook.LiquidityIsLocked.selector);
+        factory.unseed(key, TICK_LOWER, START_TICK, 1);
+
+        _expectHookRevert(address(hook), IHooks.beforeRemoveLiquidity.selector, PimdHook.LiquidityIsLocked.selector);
+        factory.unseed(key, TICK_LOWER, START_TICK, type(uint128).max / 2);
+
+        assertEq(token.balanceOf(address(factory)), pimdBefore, "no PIMD came back out");
+        assertEq(imd.balanceOf(address(factory)), imdBefore, "and no IMD either");
     }
 
     /// A zero delta is a fee collection, not a withdrawal, and has to keep working or the pool's own fee
-    /// would be stranded forever.
+    /// would be stranded forever. V4 routes a zero delta to `beforeRemoveLiquidity`, so this is the case
+    /// the lock has to let through, and the one that makes `< 0` rather than `<= 0` the right test.
     function test_fee_collection_is_still_allowed() public {
         _pastLaunchCap();
         _buy(alice, 10e18);
-        factory.seed(key, TICK_LOWER, START_TICK, 0); // zero delta: a fee collection, not a withdrawal
+        uint256 pimdBefore = token.balanceOf(address(factory));
+        uint256 imdBefore = imd.balanceOf(address(factory));
+
+        // Not reverting is the whole assertion: V4 routes a zero delta to `beforeRemoveLiquidity`, so a lock
+        // written as `<= 0` instead of `< 0` would strand the pool's own fee here forever.
+        factory.seed(key, TICK_LOWER, START_TICK, 0);
+
+        assertGe(token.balanceOf(address(factory)), pimdBefore, "nothing was taken from the factory");
+        assertGe(imd.balanceOf(address(factory)), imdBefore, "in either currency");
+        assertTrue(hook.seeded(), "and the position is still seeded");
     }
 
     function test_bind_is_one_shot() public {
