@@ -28,25 +28,31 @@ interface IERC20Quote {
 
 /// @title PimdHook
 /// @notice The Ponzinomics ($PIMD) hook. PIMD is paired with **IMD**, and every trade pays a tax **in IMD**:
-/// 3% on buys, 7% on sells. The tax is held as ERC-6909 claims inside the PoolManager and split three ways:
+/// 2.4% on buys, 5.6% on sells. The tax is held as ERC-6909 claims inside the PoolManager and split two ways:
 ///
-///   * 60% to holders, pushed to the engine, which drips it into wallets by hold-streak,
-///   * 20% to a burn budget, which buys PIMD off this pool and destroys it,
-///   * 20% to the team.
+///   * 75% to holders, pushed to the engine, which drips it into wallets by hold-streak,
+///   * 25% to the team, always in IMD, so the team never has to sell PIMD to be paid.
 ///
-/// The pool is launched single-sided: all one billion PIMD goes into one range above the opening price, so the
-/// launch needs no capital and the first buy is what puts IMD into the pool.
+/// The burn takes nothing from the tax. The launch policy makes the pool charge 1.25% of every trade and pays
+/// it to the launch's paying wallet; all of that buys PIMD and burns it, outside this contract. A trade
+/// therefore costs 3.65% to buy and 6.85% to sell, and holders and the team receive the same share of a trade
+/// they would have under the old 3%/7% with a 60/20/20 split.
 ///
-/// @dev This is PULSE v1's hook with the quote asset changed from native ETH to an ERC-20, and the emissions
-/// removed. Three things follow from the ERC-20 quote and are the reason this file deserves an audit's
-/// attention: fee claims are minted against `uint256(uint160(IMD))` rather than currency id 0; paying IMD out
-/// means burning claims and `take`-ing; and the pool only behaves like v1's if **IMD sorts below PIMD**, which
-/// the deploy script guarantees by mining the token's CREATE2 salt. `launch` refuses to run if it does not.
+/// The pool is opened and seeded by the IMD launch factory, not by this contract, single-sided in PIMD. This
+/// hook's job at launch is to refuse a pool that would be wrong: `beforeInitialize` is the only gate, and it
+/// checks the caller, the pairing, the quote currency, the fee tier and the opening price.
+///
+/// @dev This is PULSE v1's hook with the quote asset changed from native ETH to an ERC-20, the emissions
+/// removed, and the launch handed to the factory. Things that deserve an audit's attention: fee claims are
+/// minted against `uint256(uint160(IMD))` rather than currency id 0; paying IMD out means burning claims and
+/// `take`-ing; every fee calculation assumes **IMD is currency0**, which `beforeInitialize` enforces rather
+/// than assumes; and liquidity can never leave this pool, because `beforeRemoveLiquidity` refuses every
+/// negative delta from every caller forever, which is what makes it safe for the factory to hold the position.
 ///
 /// What is deliberately absent, because we are not using it and every line is audit surface: minting of any
-/// kind, the decaying launch tax (the engine's 0x first hour does that job), the burn party, and the
-/// large-sell booster. There is no owner. The team wallet, the engine and the launcher are fixed at
-/// construction and cannot be changed afterwards.
+/// kind, the decaying launch tax (the engine's 0x first hour does that job), the burn party, the large-sell
+/// booster, and the buy-and-burn that used to live here. There is no owner, no admin and no launcher: the team
+/// wallet, the engine, the quote and the factory are written into the source and cannot be changed.
 contract PimdHook is IHooks, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
@@ -57,9 +63,6 @@ contract PimdHook is IHooks, IUnlockCallback {
     uint256 public constant BUY_TAX_BPS = 240; // 2.4%, and the pool charges 1.25% on top
     uint256 public constant SELL_TAX_BPS = 560; // 5.6%, likewise
     uint256 public constant HOLDERS_BPS = 7_500; // 75% of the tax; the team gets the remaining 25%
-    /// @dev The burn takes nothing from the tax any more. It is funded by the pool's own 1.25% fee, which
-    /// pays the launch's paying wallet: the PIMD half is burned as it arrives, the IMD half buys PIMD and
-    /// burns that. Holders and the team keep exactly the share of a trade they had before.
     /// @dev Fail-open bound on the block-based launch cap. On Arbitrum Orbit `block.number` is the L1 block, so
     /// if the ArbSys precompile ever stopped answering, the block test alone would keep the cap on forever.
     uint256 public constant LAUNCH_CAP_MAX_SECONDS = 1 hours;
