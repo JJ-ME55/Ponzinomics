@@ -264,6 +264,71 @@ contract PimdAttacksTest is PimdBaseTest {
         assertEq(engine.holderCount(), 2, "neither a healthy holder nor an unrelated pair is prunable");
     }
 
+    /// The same play as above, but checking the thing that matters more than being able to clean up after
+    /// it: the pair takes nothing even in the first epoch after its code lands, so there is no window to
+    /// farm while waiting for somebody to notice and prune.
+    function test_a_holder_that_turns_pool_shaped_earns_nothing_at_once() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        _register(alice);
+
+        // funded by its own buyer, so alice keeps a full bag and goes on earning normally
+        address lair = address(uint160(0xBEEF01));
+        _buy(bob, 200e18);
+        uint256 bag = token.balanceOf(bob); // read first: a call inside the argument eats the prank
+        vm.prank(bob);
+        token.transfer(lair, bag);
+        _register(lair);
+        assertGe(token.balanceOf(lair), engine.minBalance(), "a real bag");
+        vm.warp(block.timestamp + 2 days); // the streak matures while it is still a plain address
+
+        // and only now does the pair land on it
+        vm.etch(lair, address(new FakePair(address(token))).code);
+        vm.store(lair, bytes32(0), bytes32(uint256(uint160(address(token)))));
+
+        _runEpoch();
+        assertEq(imd.balanceOf(lair), 0, "the pair earns nothing the first epoch after its code lands");
+        assertGt(imd.balanceOf(alice), 0, "while the real holder is paid as usual");
+    }
+
+    /// The blunt side of that check: it fires on any code arriving where `register` saw none, not just on a
+    /// pair, because the two cannot be told apart in advance. A wallet that legitimately grows code -- a
+    /// delegation, a smart-wallet upgrade -- therefore stops earning, so it must not be stuck that way. It
+    /// is prunable on the same test, which lets it come back vetted on what it actually is now.
+    function test_a_wallet_that_grows_code_is_not_stuck_at_zero() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        _register(alice);
+
+        // funded by its own buyer, so alice keeps a full bag and goes on earning normally
+        address wallet = address(uint160(0xBEEF02));
+        _buy(bob, 200e18);
+        uint256 bag = token.balanceOf(bob); // read first: a call inside the argument eats the prank
+        vm.prank(bob);
+        token.transfer(wallet, bag);
+        _register(wallet);
+        assertGe(token.balanceOf(wallet), engine.minBalance(), "a real bag");
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+
+        // code arrives, but it is nobody's pair
+        vm.etch(wallet, address(new FakePair(address(0xdead))).code);
+        _runEpoch();
+        assertEq(imd.balanceOf(wallet), 0, "the vetted shape is gone, so it earns nothing for now");
+
+        address[] memory one = new address[](1);
+        one[0] = wallet;
+        engine.prune(one);
+        assertEq(engine.holderCount(), 1, "prunable despite a bag well over the minimum");
+        _register(wallet);
+        assertEq(engine.holderCount(), 2, "and back in, vetted as the contract it now is");
+
+        // getBlockTimestamp, not block.timestamp: solc caches the latter across a vm.warp, which would
+        // silently make this second warp a no-op and the fire below TooSoon
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        _runEpoch();
+        assertGt(imd.balanceOf(wallet), 0, "earning again, on its real shape");
+    }
+
     function test_dust_holder_is_skipped_and_prunable() public {
         _pastLaunchCap();
         _buy(alice, 200e18);

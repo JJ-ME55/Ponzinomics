@@ -123,7 +123,8 @@ contract PimdEngine is ReentrancyGuard {
     struct Holder {
         uint128 lastBal; // PIMD balance at the last tally
         uint64 streakStart; // blended hold clock
-        uint64 index1; // 1-based index into `holders`; 0 = not registered
+        uint32 index1; // 1-based index into `holders`; 0 = not registered. uint32 because maxHolders <= 5,000
+        bool vettedCodeless; // the address had no code when `register` probed it; see `_shapeChanged`
         uint128 weight; // this epoch's weight, set in tally and cleared in pay
         uint128 received; // lifetime IMD received from this engine
     }
@@ -265,7 +266,10 @@ contract PimdEngine is ReentrancyGuard {
             if (holders.length >= maxHolders) revert HolderSetFull(maxHolders);
             holders.push(a);
             Holder storage h = _holder[a];
-            h.index1 = uint64(holders.length);
+            h.index1 = uint32(holders.length);
+            // What `_isPool` was actually able to check. A codeless address is passed without being probed
+            // at all, so that verdict only holds while it stays codeless; `_shapeChanged` is what notices.
+            h.vettedCodeless = a.code.length == 0;
             h.lastBal = uint128(bal);
             h.streakStart = uint64(block.timestamp); // the clock starts at registration, never earlier
             emit Registered(a);
@@ -293,10 +297,10 @@ contract PimdEngine is ReentrancyGuard {
             // only way such a holder ever leaves the set -- a pooled bag does not fall below the minimum on
             // its own. The probe is paid for by whoever calls `prune`, exactly as it is at `register`, and it
             // reads only the address being pruned, so it cannot be aimed at anybody else.
-            if (IERC20Min(token).balanceOf(a) >= minBalance && !_isPool(a)) continue;
+            if (IERC20Min(token).balanceOf(a) >= minBalance && !_shapeChanged(a, _holder[a]) && !_isPool(a)) continue;
             address last = holders[holders.length - 1];
             holders[idx1 - 1] = last;
-            _holder[last].index1 = uint64(idx1);
+            _holder[last].index1 = uint32(idx1);
             holders.pop();
             delete _holder[a];
             emit Pruned(a);
@@ -373,6 +377,12 @@ contract PimdEngine is ReentrancyGuard {
     /// contract that burns both probes cost about 58k gas per slot against 13.5k for a plain holder, which
     /// let a handful of hostile registrations cut the achievable set by two thirds. The check belongs at
     /// `register`, where the registrant pays for it and a pair cannot get in to begin with.
+    ///
+    /// What is called here is `_shapeChanged`, which costs one `EXTCODESIZE` and calls nothing. `register`
+    /// can only probe what is in front of it, and it passes a codeless address without probing at all, so
+    /// an address CREATE2 chose could be registered empty, left to mature a streak, and only then given
+    /// pair code. Re-probing would catch it and cannot be afforded; noticing that code arrived where there
+    /// was none is nearly free, and takes the weight away the same epoch.
     function tally(uint256 maxHolders) external nonReentrant {
         if (phase != Phase.Tally) revert WrongPhase();
         _requireLocked();
@@ -398,7 +408,7 @@ contract PimdEngine is ReentrancyGuard {
             uint256 eff = bal < last ? bal : last;
             h.lastBal = uint128(bal);
             uint256 w;
-            if (eff >= minBalance) w = (eff * tierBps(nowTs - h.streakStart)) / BPS;
+            if (eff >= minBalance && !_shapeChanged(a, h)) w = (eff * tierBps(nowTs - h.streakStart)) / BPS;
             h.weight = uint128(w);
             tw += w;
         }
@@ -597,6 +607,17 @@ contract PimdEngine is ReentrancyGuard {
             pot += amt;
             tipBudget = budget;
         }
+    }
+
+    /// True when an address no longer has the shape `register` vetted: it had no code then and has code now.
+    /// `_isPool` cannot be afforded in the tally loop, but this can -- one `EXTCODESIZE`, and unlike a probe it
+    /// calls nothing, so a holder cannot burn gas or bomb return data to make it cost more. It is deliberately
+    /// blunt: any code arriving at an address that was vetted codeless voids the verdict, because the pair that
+    /// lands there is indistinguishable in advance from anything else. A holder this catches earns nothing, and
+    /// `prune` drops it on the same test, so the address can be registered again on its real shape -- which is
+    /// what keeps this from stranding, at zero weight for ever, an ordinary wallet that legitimately grows code.
+    function _shapeChanged(address a, Holder storage h) internal view returns (bool) {
+        return h.vettedCodeless && a.code.length != 0;
     }
 
     /// True for a contract that reports PIMD as either side of a pair: a rogue V2/V3-style pool must not collect
