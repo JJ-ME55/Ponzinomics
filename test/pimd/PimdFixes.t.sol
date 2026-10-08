@@ -145,12 +145,17 @@ contract PimdFixesTest is PimdBaseTest {
         }
         assertEq(engine.holderCount(), 3, "at the bound");
 
+        // A full set skips the address rather than reverting the batch, so that `_reclaimSlot`'s cursor
+        // write survives the call. The bound is still absolute: all three entries are live, so there is
+        // nothing to reclaim and nothing gets in.
         address extra = address(uint160(0x30000));
         _buy(extra, 20e18);
         address[] memory one = new address[](1);
         one[0] = extra;
-        vm.expectRevert(abi.encodeWithSelector(PimdEngine.HolderSetFull.selector, 3));
         engine.register(one);
+        assertEq(engine.holderCount(), 3, "still at the bound");
+        (bool registered,,,,) = engine.holderInfo(extra);
+        assertFalse(registered, "and the extra address did not get in");
     }
 
     // ================================================================= audit over 0fc1ff2
@@ -240,16 +245,21 @@ contract PimdFixesTest is PimdBaseTest {
     /// Finding 7, low. maxHolders exists so the whole-set tally fits one transaction. The budget is not the
     /// 2^50 in the block header, which is an Arbitrum placeholder, but ArbOS's maxTxGasLimit: 32,000,000 on
     /// this chain. At the measured cost a bound of 1,200 could never have been weighed.
+    /// Round 2 finding 7. The budget is ArbOS's maxTxGasLimit, 32,000,000 on this chain, not the 2^50
+    /// placeholder in the block header. And the cost that matters is the one with balances moving between
+    /// tallies -- 37-38k a weighted holder -- not the 34.6k Gas.t.sol measures when nothing has changed,
+    /// which is what put the first version of this ceiling at an unweighable 900.
     function test_the_holder_bound_fits_the_chains_per_transaction_budget() public {
         uint256 ARBOS_MAX_TX_GAS = 32_000_000;
-        uint256 measuredPerHolder = 34_576; // test/pimd/Gas.t.sol, first-page worst case
+        uint256 worstCasePerHolder = 38_000; // balances changed since the last tally
 
         vm.expectRevert(PimdEngine.BadConfig.selector);
-        new PimdEngine(_cfg(901));
-        PimdEngine ok = new PimdEngine(_cfg(900));
-        assertEq(ok.maxHolders(), 900, "900 is the hard ceiling");
-        assertLt(900 * measuredPerHolder, ARBOS_MAX_TX_GAS, "the ceiling is weighable");
-        assertGt(1_200 * measuredPerHolder, ARBOS_MAX_TX_GAS, "the old launch value was not");
+        new PimdEngine(_cfg(801));
+        PimdEngine ok = new PimdEngine(_cfg(800));
+        assertEq(ok.maxHolders(), 800, "800 is the hard ceiling");
+        assertLt(800 * worstCasePerHolder, ARBOS_MAX_TX_GAS, "the ceiling is weighable at the worst cost");
+        assertGt(900 * worstCasePerHolder, ARBOS_MAX_TX_GAS, "900 was not");
+        assertGt(1_200 * worstCasePerHolder, ARBOS_MAX_TX_GAS, "nor was the original 1,200");
     }
 
     function _cfg(uint256 maxHolders_) internal view returns (PimdEngine.Config memory) {
@@ -509,5 +519,61 @@ contract PimdFixesTest is PimdBaseTest {
         c.maxHolders = 5_001;
         vm.expectRevert(PimdEngine.BadConfig.selector);
         new PimdEngine(c);
+    }
+}
+
+/// Round 2 finding 2, medium, and a mistake of mine. `_reclaimSlot` advances its cursor when it finds
+/// nothing, but `register` used to revert on a miss, and a revert undoes the write. So the sweep re-read
+/// the same eight entries for ever and a dead slot behind eight live ones was never reclaimed, which
+/// brought back the lockout the reclaim was written to stop for the price of registering eight real bags.
+///
+/// This needs its own bound: with a set smaller than RECLAIM_PROBES the sweep wraps and finds the dead
+/// entry inside one call, so the cursor is never load-bearing and the bug hides. Ten entries with the
+/// first eight live is the smallest shape that forces a second call to resume where the first stopped.
+contract PimdReclaimCursorTest is PimdBaseTest {
+    function _maxHolders() internal view override returns (uint256) {
+        return 10;
+    }
+
+    function test_a_dead_slot_behind_eight_live_ones_is_still_reclaimed() public {
+        _pastLaunchCap();
+        _buy(alice, 400e18);
+        uint256 min = engine.minBalance();
+        assertGe(token.balanceOf(alice), min * 11, "alice can fund eleven minimum bags");
+
+        // indices 0..7: live holders, each with a bag that stays
+        for (uint256 i; i < 8; ++i) {
+            address live = address(uint160(0x50000 + i));
+            vm.prank(alice);
+            token.transfer(live, min);
+            _register(live);
+        }
+        // indices 8..9: one bag walked through two addresses, then moved on
+        address g0 = address(uint160(0x60000));
+        address g1 = address(uint160(0x60001));
+        vm.prank(alice);
+        token.transfer(g0, min);
+        _register(g0);
+        vm.prank(g0);
+        token.transfer(g1, min);
+        _register(g1);
+        assertEq(engine.holderCount(), 10, "the set is full");
+        assertEq(engine.reclaimCursor(), 0, "and the sweep has not moved");
+        assertLt(token.balanceOf(g0), min, "the dead slot is at index 8, behind eight live ones");
+
+        // an honest holder with a real bag: the first call cannot reach index 8 in eight probes, so the
+        // cursor has to survive that miss for the second call to get there
+        address honest = makeAddr("honestFar");
+        vm.prank(g1);
+        token.transfer(honest, min);
+        address[] memory one = new address[](1);
+        one[0] = honest;
+        engine.register(one);
+        engine.register(one);
+        engine.register(one);
+
+        (bool registered,,,,) = engine.holderInfo(honest);
+        assertTrue(registered, "the honest holder got in, so the sweep reached past the live head");
+        assertEq(engine.holderCount(), 10, "the set is still bounded");
     }
 }

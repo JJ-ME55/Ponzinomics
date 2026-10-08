@@ -59,10 +59,11 @@ contract DeployPimd is Script {
             // `tally` weighs the whole holder set in one call, so the set has to fit one transaction.
             // The budget is NOT the 2^50 in the block header -- that is an Arbitrum placeholder. It is
             // ArbOS's maxTxGasLimit, which this chain's ArbGasInfo precompile (0x6C,
-            // getGasAccountingParams) reports as 32,000,000. At a measured 34.6k gas a weighted holder,
-            // 800 is 27.7M, 86% of the budget, which leaves room for a gas-schedule change we cannot
-            // amend for. 1,200 was 41.5M and could not have been weighed at all. Audit finding 7.
-            maxHolders: vm.envOr("MAX_HOLDERS", uint256(800))
+            // getGasAccountingParams) reports as 32,000,000. Cost per weighted holder is 37-38k once
+            // balances move between tallies, which is the case that counts; the 34.6k in Gas.t.sol is
+            // the cheap state where no balance changed. So 700 is about 26M, 81% of the budget, under a
+            // constructor ceiling of 800 (29.6M). 1,200 was 44M and could never have been weighed.
+            maxHolders: vm.envOr("MAX_HOLDERS", uint256(700))
         });
 
         vm.broadcast(pk);

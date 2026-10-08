@@ -173,6 +173,9 @@ contract PimdEngine is ReentrancyGuard {
     error NotBound();
     error WrongPhase();
     error TallyMustBeWhole(uint256 holders);
+    /// @dev No longer thrown: a full set makes `register` skip the address instead, so that
+    /// `_reclaimSlot`'s cursor survives the call. Kept so the ABI does not change under anything
+    /// already watching for it.
     error HolderSetFull(uint256 max);
     error TooSoon();
     error BadConfig();
@@ -186,12 +189,17 @@ contract PimdEngine is ReentrancyGuard {
         if (c.maxCatchup < PERIOD || c.maxCatchup > 7 days) revert BadConfig();
         // An upper bound on the bound itself: past this the whole-set tally cannot fit in a block on any
         // chain we would launch on, so a config that allowed it would be reintroducing the brick.
-        // 900 is a hard ceiling, not a preference: `tally` weighs the whole set in one transaction and
-        // costs about 34.6k gas a weighted holder, so 900 is 31.1M against the 32M ArbOS per-transaction
-        // limit this chain enforces (ArbGasInfo at 0x6C, getGasAccountingParams, returns a 32,000,000
-        // maxTxGasLimit). Above that an epoch cannot be weighed at all, and with no owner there would be
-        // no way to lower the bound afterwards. Audit finding 7.
-        if (c.maxHolders == 0 || c.maxHolders > 900) revert BadConfig();
+        // A hard ceiling, not a preference: `tally` weighs the whole set in one transaction, against the
+        // 32M ArbOS per-transaction limit this chain enforces (ArbGasInfo at 0x6C,
+        // getGasAccountingParams, returns a 32,000,000 maxTxGasLimit). Above it an epoch cannot be
+        // weighed at all, and with no owner the bound could never be lowered afterwards.
+        //
+        // The number that matters is the worst case, not the cheap one. Gas.t.sol measures 34.6k a holder
+        // with every balance unchanged since registration, where the lastBal slot is rewritten with the
+        // same value for 100 gas. In a market that trades, that write is a nonzero-to-nonzero SSTORE and
+        // the streak blend runs: 37-38k a holder. 900 at that cost is 33.3M and cannot execute, which is
+        // round 2's finding 7 against the first version of this line. 800 is 29.6M.
+        if (c.maxHolders == 0 || c.maxHolders > 800) revert BadConfig();
         poolManager = IPoolManager(c.poolManager);
         imd = IERC20Min(c.imd);
         team = c.team;
@@ -292,10 +300,16 @@ contract PimdEngine is ReentrancyGuard {
             // be unrecoverable, and registration is permissionless so anyone could cause it.
             // A slot used to be claimed on the balance of one instant and then held for ever, so one
             // minimum bag walked through fresh addresses filled the set and locked everybody out of
-            // registering, permanently, with no owner to undo it. Audit finding 2. A full set now gives
-            // up a slot held by an entry that no longer qualifies, which makes padding a cost the
-            // attacker has to keep paying rather than a thing they buy once.
-            if (holders.length >= maxHolders && !_reclaimSlot()) revert HolderSetFull(maxHolders);
+            // registering, permanently, with no owner to undo it. A full set gives up a slot held by an
+            // entry that no longer qualifies, which makes padding a cost the attacker keeps paying.
+            //
+            // Skipping rather than reverting is the whole point, and it is not cosmetic: `_reclaimSlot`
+            // advances its cursor when it finds nothing, and a revert would undo that write, so the sweep
+            // would re-read the same eight entries for ever and a dead slot behind eight live ones would
+            // never be reclaimed. That was round 2's finding 2 against the first version of this.
+            // `register` already skips silently -- excluded, dust, pool-shaped, already in -- so a full
+            // set is one more reason it passes over an address rather than failing the batch.
+            if (holders.length >= maxHolders && !_reclaimSlot()) continue;
             holders.push(a);
             Holder storage h = _holder[a];
             h.index1 = uint32(holders.length);
