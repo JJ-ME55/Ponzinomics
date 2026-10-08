@@ -272,7 +272,8 @@ contract PimdEngine is ReentrancyGuard {
         }
     }
 
-    /// @notice Removes registered holders whose bag has fallen below the minimum, keeping the tally loop lean.
+    /// @notice Removes registered holders whose bag has fallen below the minimum, or that have since become
+    /// pool-shaped, keeping the tally loop lean and pooled PIMD out of the drip.
     /// @dev Only between epochs. It does swap-and-pop on `holders`, which moves indices, and both `tally` and
     /// `pay` walk that array against the `epochCount` snapshot taken at `fire`. Allowing it mid-epoch was a
     /// brick: one call shortened the array under a running tally, so the loop read past the end and reverted
@@ -284,7 +285,15 @@ contract PimdEngine is ReentrancyGuard {
         for (uint256 i; i < accounts.length; ++i) {
             address a = accounts[i];
             uint256 idx1 = _holder[a].index1;
-            if (idx1 == 0 || IERC20Min(token).balanceOf(a) >= minBalance) continue;
+            if (idx1 == 0) continue;
+            // A big enough bag keeps a holder registered, unless the address has since started reporting PIMD
+            // as a pair side. `register` probes for that, but it can only see what is there at the time: a
+            // codeless address passes without being probed at all, and the code can arrive afterwards at an
+            // address CREATE2 picked. `tally` does not re-probe, for the reason given there, so this is the
+            // only way such a holder ever leaves the set -- a pooled bag does not fall below the minimum on
+            // its own. The probe is paid for by whoever calls `prune`, exactly as it is at `register`, and it
+            // reads only the address being pruned, so it cannot be aimed at anybody else.
+            if (IERC20Min(token).balanceOf(a) >= minBalance && !_isPool(a)) continue;
             address last = holders[holders.length - 1];
             holders[idx1 - 1] = last;
             _holder[last].index1 = uint64(idx1);
@@ -592,8 +601,9 @@ contract PimdEngine is ReentrancyGuard {
 
     /// True for a contract that reports PIMD as either side of a pair: a rogue V2/V3-style pool must not collect
     /// drips that its LPs would then capture.
-    /// @dev Runs inside the tally loop, so a hostile holder contract must not be able to stall an epoch: each
-    /// probe is a gas-capped staticcall that reads at most one word of return data.
+    /// @dev Called from `register` and `prune`, never from `tally` -- see the note on `tally` for why. Each
+    /// probe is still a gas-capped staticcall that reads at most one word of return data, so a hostile holder
+    /// cannot bomb or stall the caller; it can only make its own registration or pruning cost more.
     function _isPool(address a) internal view returns (bool) {
         if (a.code.length == 0) return false;
         address t = token;

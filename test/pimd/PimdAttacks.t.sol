@@ -214,6 +214,56 @@ contract PimdAttacksTest is PimdBaseTest {
         assertEq(imd.balanceOf(address(pair)), 0, "a pair holding PIMD collects nothing");
     }
 
+    /// A pair cannot register, but it can be registered before it exists. CREATE2 lets the attacker pick the
+    /// address: fund it with PIMD, register it while it is still codeless -- `_isPool` passes a codeless
+    /// address without probing it -- let the streak mature, and only then deploy the pair code. `tally`
+    /// deliberately does not re-probe, so nothing takes the weight back off it, and the balance test in
+    /// `prune` never fires because a pooled bag does not fall. So `prune` has to be able to take it out on
+    /// the shape rather than the size, or the pair holds a matured dividend claim on pooled PIMD for good.
+    function test_a_holder_that_turns_pool_shaped_is_prunable() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        _register(alice);
+
+        // an address the attacker picked, funded and registered while it still has no code
+        address lair = address(uint160(0xBEEF00));
+        uint256 half = token.balanceOf(alice) / 2; // read first: a call inside the argument eats the prank
+        vm.prank(alice);
+        token.transfer(lair, half);
+        _register(lair);
+        assertEq(engine.holderCount(), 2, "a codeless address registers fine");
+
+        // the streak matures, and then the pair code lands on it
+        vm.warp(block.timestamp + 2 days);
+        vm.etch(lair, address(new FakePair(address(token))).code);
+        vm.store(lair, bytes32(0), bytes32(uint256(uint160(address(token)))));
+        assertEq(FakePair(lair).token0(), address(token), "it reports PIMD as token0 now");
+        assertGe(token.balanceOf(lair), engine.minBalance(), "and its bag never fell below the minimum");
+
+        address[] memory one = new address[](1);
+        one[0] = lair;
+        engine.prune(one);
+        assertEq(engine.holderCount(), 1, "the pool was pruned despite its bag");
+        (bool registered,,,,) = engine.holderInfo(lair);
+        assertFalse(registered, "and its record is gone");
+
+        // It has to cut one way only. `prune` reads nothing but the address it is handed, so it cannot be
+        // aimed at a healthy holder, nor at a contract that is a pair for some other token.
+        FakePair other = new FakePair(address(0xdead));
+        _buy(bob, 200e18);
+        uint256 bobBag = token.balanceOf(bob); // read first: a call inside the argument eats the prank
+        vm.prank(bob);
+        token.transfer(address(other), bobBag);
+        _register(address(other));
+        assertEq(engine.holderCount(), 2, "a pair for some other token is a normal holder");
+
+        address[] memory two = new address[](2);
+        two[0] = alice;
+        two[1] = address(other);
+        engine.prune(two);
+        assertEq(engine.holderCount(), 2, "neither a healthy holder nor an unrelated pair is prunable");
+    }
+
     function test_dust_holder_is_skipped_and_prunable() public {
         _pastLaunchCap();
         _buy(alice, 200e18);
