@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Vm} from "forge-std/Vm.sol";
 import {PimdBaseTest} from "./PimdBase.t.sol";
 import {PimdEngine} from "../../src/pimd/PimdEngine.sol";
 import {PimdHook} from "../../src/pimd/PimdHook.sol";
@@ -339,6 +340,165 @@ contract PimdFixesTest is PimdBaseTest {
         new PimdEngine(c);
     }
 
+    // ================================================================= independent review
+    /// Adversarial finding 2, medium. `_shapeChanged` voided the vetted verdict of any holder registered
+    /// codeless that later grew code -- and a plain wallet grows exactly 23 bytes the moment its owner
+    /// installs an EIP-7702 delegation. Such a holder earned nothing and could be pruned by any stranger,
+    /// which also destroyed a matured streak, because registering again restarts the clock.
+    function test_a_7702_delegated_wallet_keeps_earning_and_its_streak() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        _buy(bob, 200e18);
+        _register(alice);
+        _register(bob);
+        vm.warp(vm.getBlockTimestamp() + 15 days);
+        (,,, uint256 tierBefore,) = engine.holderInfo(alice);
+        assertEq(tierBefore, 30_000, "alice has a matured 3x streak");
+
+        // alice installs a delegation: 0xef0100 followed by the delegate's address, 23 bytes
+        address delegate = makeAddr("smartWalletImpl");
+        vm.etch(alice, abi.encodePacked(hex"ef0100", delegate));
+        assertEq(alice.code.length, 23, "alice now carries a delegation stub");
+
+        // a stranger cannot prune her for it
+        address griefer = makeAddr("griefer");
+        address[] memory one = new address[](1);
+        one[0] = alice;
+        vm.prank(griefer);
+        engine.prune(one);
+        (bool stillIn,,, uint256 tierAfter,) = engine.holderInfo(alice);
+        assertTrue(stillIn, "still registered");
+        assertEq(tierAfter, 30_000, "and still at 3x");
+
+        // and she is still weighed
+        uint256 before = imd.balanceOf(alice);
+        _runEpoch();
+        assertGt(imd.balanceOf(alice) - before, 0, "a delegated wallet is still paid");
+    }
+
+    /// And the carve-out must not reopen what the check is for. The code etched here answers neither
+    /// `token0` nor `token1`, so `_isPool` is false and `_shapeChanged` is the only thing that can catch
+    /// it -- which is the point: an earlier version of this test etched pair code, so `prune` removed the
+    /// holder through its `!_isPool` branch and the assertion held even with `_shapeChanged` stubbed out
+    /// to `return false`. It passed its own mutation.
+    function test_real_code_still_voids_the_vetted_shape() public {
+        _pastLaunchCap();
+        address lair = address(uint160(0xC0DE00));
+        _buy(alice, 300e18);
+        uint256 bag = token.balanceOf(alice) / 2;
+        vm.prank(alice);
+        token.transfer(lair, bag);
+        _register(lair);
+        assertGe(token.balanceOf(lair), engine.minBalance(), "its bag stays over the minimum");
+
+        // not a pair, and not a 23-byte delegation stub either
+        vm.etch(lair, address(new PlainContract()).code);
+        assertGt(lair.code.length, 23, "the code is real, not a stub");
+        (bool okProbe,) = lair.staticcall(abi.encodeWithSignature("token0()"));
+        assertFalse(okProbe, "and it answers no pair probe, so _isPool cannot be what catches it");
+
+        address[] memory one = new address[](1);
+        one[0] = lair;
+        engine.prune(one);
+        (bool registered,,,,) = engine.holderInfo(lair);
+        assertFalse(registered, "code that is not a delegation stub still voids the vetted shape");
+    }
+
+    /// Adversarial finding 3, low. An epoch where every holder weighs zero hands the whole drip back, so
+    /// it owes no per-holder tip. `fireTip` is paid by `fire` before anything is weighed and cannot be
+    /// clawed back, but it is capped by the same 5% budget, and the budget is now closed out.
+    /// `fireTip` is paid by `fire` before anything is weighed and cannot be clawed back; what this pins
+    /// is that the per-holder tip, which is the larger part on a real set, is not paid for distributing
+    /// nothing. The budget has to outlive `fireTip` for that to mean anything -- an earlier version of
+    /// this test used a three-minute drip whose whole 5% budget went to `fireTip`, so "the tally was not
+    /// tipped" was true however the code behaved, and it passed its own mutation. Hence the long gap and
+    /// the precondition below.
+    function test_a_null_epoch_pays_no_per_holder_tip() public {
+        _pastLaunchCap();
+        _buy(alice, 300e18);
+        _buy(bob, 300e18);
+        vm.prank(keeper);
+        hook.flush(); // income banked, so the pot is big before the clock runs
+        vm.warp(vm.getBlockTimestamp() + 6 hours); // a full catch-up, so the drip is large
+
+        _buy(carol, 300e18);
+        _register(carol); // registered this second: tier 0, so the whole set weighs nothing
+        assertEq(engine.holderCount(), 1, "there is a holder, so this is a real epoch with no weight");
+        vm.prank(keeper);
+        engine.fire();
+
+        uint256 budget = engine.tipBudget();
+        assertGt(budget, 0, "the tip budget outlived fireTip, so a tally tip would be payable");
+        uint256 afterFire = imd.balanceOf(keeper);
+        uint256 potAfterFire = engine.pot();
+
+        vm.prank(keeper);
+        engine.tally(500);
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Idle), "the null epoch closed");
+        assertEq(engine.totalDripped(), 0, "and distributed nothing");
+        assertEq(imd.balanceOf(keeper), afterFire, "so the tally was not tipped");
+        assertEq(engine.tipBudget(), 0, "and what was left of the budget went back");
+        assertGt(engine.pot(), potAfterFire, "the drip itself returned to the pot");
+    }
+
+    /// Build-review D1, low. `totalToTeam` booked the gross slice while the team received it net of the
+    /// outside caller's tip, overstating by the tip on every flush.
+    function test_total_to_team_matches_what_the_team_received() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        address flusher = makeAddr("flusher");
+        uint256 teamBefore = imd.balanceOf(team);
+        uint256 bookedBefore = hook.totalToTeam();
+
+        vm.prank(flusher);
+        hook.flush();
+
+        uint256 got = imd.balanceOf(team) - teamBefore;
+        assertGt(got, 0, "the team was paid");
+        assertGt(imd.balanceOf(flusher), 0, "and the outside caller took its tip");
+        assertEq(hook.totalToTeam() - bookedBefore, got, "the stat equals the payment");
+    }
+
+    /// Build-review D2, low. `Fired` was emitted before the early return, announcing an epoch that never
+    /// opened and carrying a number the next real fire would use again.
+    function test_a_fire_that_opens_no_epoch_emits_nothing() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18); // income, but nobody registered
+        vm.prank(keeper);
+        hook.flush();
+        vm.warp(vm.getBlockTimestamp() + 3 minutes);
+        assertEq(engine.holderCount(), 0, "no holders");
+
+        vm.recordLogs();
+        vm.prank(keeper);
+        engine.fire();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != PimdEngine.Fired.selector, "no Fired for an epoch that did not open");
+        }
+        assertEq(engine.epoch(), 0, "and no epoch number was consumed");
+    }
+
+    /// Build-review B1, low. A registration passed over because the set was full and the sweep found
+    /// nothing left no trace at all, and it is the one skip reason a caller cannot predict off chain.
+    function test_a_deferred_registration_says_so() public {
+        _pastLaunchCap();
+        for (uint256 i; i < 3; ++i) {
+            address live = address(uint160(0x70000 + i));
+            _buy(live, 20e18);
+            _register(live);
+        }
+        assertEq(engine.holderCount(), 3, "full, all live");
+
+        address extra = address(uint160(0x80000));
+        _buy(extra, 20e18);
+        address[] memory one = new address[](1);
+        one[0] = extra;
+        vm.expectEmit(true, false, false, false, address(engine));
+        emit PimdEngine.RegistrationDeferred(extra, 0);
+        engine.register(one);
+    }
+
     function _cfg(uint256 maxHolders_) internal view returns (PimdEngine.Config memory) {
         return PimdEngine.Config({
             poolManager: address(manager),
@@ -655,5 +815,24 @@ contract PimdReclaimCursorTest is PimdBaseTest {
         (bool registered,,,,) = engine.holderInfo(honest);
         assertTrue(registered, "the honest holder got in, so the sweep reached past the live head");
         assertEq(engine.holderCount(), 10, "the set is still bounded");
+    }
+}
+
+contract FakePairLike {
+    address public token0;
+    address public token1;
+
+    constructor(address t) {
+        token0 = t;
+        token1 = address(0xdead);
+    }
+}
+
+/// Code that is not pool-shaped and is not a delegation stub.
+contract PlainContract {
+    uint256 public value;
+
+    function poke() external {
+        value += 1;
     }
 }

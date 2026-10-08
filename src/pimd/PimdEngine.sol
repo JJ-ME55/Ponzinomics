@@ -144,7 +144,7 @@ contract PimdEngine is ReentrancyGuard {
     struct Holder {
         uint128 lastBal; // PIMD balance at the last tally
         uint64 streakStart; // blended hold clock
-        uint32 index1; // 1-based index into `holders`; 0 = not registered. uint32 because maxHolders <= 5,000
+        uint32 index1; // 1-based index into `holders`; 0 = not registered. uint32 because maxHolders <= 800
         bool vettedCodeless; // the address had no code when `register` probed it; see `_shapeChanged`
         uint128 weight; // this epoch's weight, set in tally and cleared in pay
         uint128 received; // lifetime IMD received from this engine
@@ -182,6 +182,9 @@ contract PimdEngine is ReentrancyGuard {
     event PayoutFailed(address indexed holder, uint256 amount);
     event Registered(address indexed holder);
     event Pruned(address indexed holder);
+    /// @notice A registration passed over because the set was full and the sweep found nothing to
+    /// reclaim. The one skip reason a caller cannot predict off chain, so it is the one that says so.
+    event RegistrationDeferred(address indexed holder, uint256 cursor);
 
     // ------------------------------------------------------------------ errors
     error NotBinder();
@@ -333,7 +336,10 @@ contract PimdEngine is ReentrancyGuard {
             // never be reclaimed. That was round 2's finding 2 against the first version of this.
             // `register` already skips silently -- excluded, dust, pool-shaped, already in -- so a full
             // set is one more reason it passes over an address rather than failing the batch.
-            if (holders.length >= maxHolders && !_reclaimSlot()) continue;
+            if (holders.length >= maxHolders && !_reclaimSlot()) {
+                emit RegistrationDeferred(a, reclaimCursor);
+                continue;
+            }
             holders.push(a);
             Holder storage h = _holder[a];
             h.index1 = uint32(holders.length);
@@ -400,11 +406,13 @@ contract PimdEngine is ReentrancyGuard {
         uint256 drip = _released(pot, elapsed);
 
         uint256 n = holders.length;
-        emit Fired(epoch + 1, drip, n);
         // No drip or nobody to pay is not an epoch. Leave `lastFire` alone so the elapsed time is not
         // forfeited, and pay no tip: there is no work here to reward, and paying for it let a caller
-        // drain the tip budget out of the pot by firing into an empty holder set.
+        // drain the tip budget out of the pot by firing into an empty holder set. Return before the
+        // event, too: announcing an epoch that does not open let anyone spam `Fired(N, 0, 0)` for an
+        // epoch number the next real fire would use again, so two could carry the same one.
         if (drip == 0 || n == 0) return;
+        emit Fired(epoch + 1, drip, n);
 
         pot -= drip;
         epochQuote = drip;
@@ -430,6 +438,16 @@ contract PimdEngine is ReentrancyGuard {
     /// attacker shuttled. Only a loop nothing can interleave with closes it. The cost is a ceiling on the
     /// holder set, which is why `maxHolders` exists and why `register` enforces it: an unbounded set with a
     /// whole-set loop meant the first `fire` past the gas ceiling wedged the engine for ever.
+    ///
+    /// What weighing on the smaller of the two balances does NOT do is make a bag you do not own
+    /// worthless, and this note used to imply otherwise. Weight is balance times tier and a balance can
+    /// be rented: an address holding a borrowed bag across the hour it takes to leave tier 0, still
+    /// holding it when the next count lands, is weighed on it like any other holder, and can return it
+    /// before `pay`, because the weight is already fixed. Requiring the bag to survive a count first
+    /// (`uncounted`) means two counts rather than one, which is minutes, not a deterrent. The ladder in
+    /// `tierBps` is the real obstacle and an hour of it is cheap. There is nowhere to borrow PIMD at
+    /// launch; if a lending market or a second pool appears, the answer is a longer floor before any
+    /// weight is earned, not a cleverer snapshot, and that is an economic change, not a patch.
     ///
     /// Weighing on the smaller of the current and previous balance is what stops borrowed weight, which the
     /// PoolManager guard alone could not: that guard only sees Uniswap V4, so a flash loan from anywhere
@@ -487,9 +505,14 @@ contract PimdEngine is ReentrancyGuard {
                 pot += epochQuote;
                 epochQuote = 0;
                 phase = Phase.Idle;
-            } else {
-                phase = Phase.Pay;
+                // And no tip. This epoch hands the whole drip back, so there is nothing to be paid out
+                // of: billing the pot for weighing a set that turned out to be worth nothing let a
+                // keeper bleed it a little on every first-hour cycle. Returning the budget as well keeps
+                // `pay`'s share of it from being spent on an epoch that never reached `pay`.
+                tipBudget = 0;
+                return;
             }
+            phase = Phase.Pay;
         }
         _tip(tipPerHolder * (end - start));
     }
@@ -678,6 +701,11 @@ contract PimdEngine is ReentrancyGuard {
     /// Swap-and-pop one entry out of the holder set. Callers must have checked that the entry may go and
     /// that no epoch is mid-flight: both `tally` and `pay` walk `holders` against the `epochCount` taken at
     /// `fire`, so shortening it under them was the brick that C2 was about.
+    /// @dev The order of the next four lines is load-bearing. `index1` must be written before `pop`,
+    /// because when `a` is itself the last element the write lands in the entry that is about to die and
+    /// `delete` then clears it. Writing it after `pop` would leave a removed address holding
+    /// `index1 == n`, and the next `prune` of it would index `n - 1` of an array of length `n - 1` and
+    /// revert out of bounds, for that address, for every caller, for ever.
     function _removeAt(uint256 idx0, address a) internal {
         address last = holders[holders.length - 1];
         holders[idx0] = last;
@@ -715,10 +743,30 @@ contract PimdEngine is ReentrancyGuard {
     /// calls nothing, so a holder cannot burn gas or bomb return data to make it cost more. It is deliberately
     /// blunt: any code arriving at an address that was vetted codeless voids the verdict, because the pair that
     /// lands there is indistinguishable in advance from anything else. A holder this catches earns nothing, and
-    /// `prune` drops it on the same test, so the address can be registered again on its real shape -- which is
-    /// what keeps this from stranding, at zero weight for ever, an ordinary wallet that legitimately grows code.
+    /// `prune` drops it on the same test, so the address can be registered again on its real shape.
+    ///
+    /// One shape is carved out: an EIP-7702 delegation, which is the 23 bytes `0xef0100` followed by the
+    /// delegate's address. A plain wallet gains exactly that the moment its owner installs one, and
+    /// treating it as a shape change meant a legitimate holder silently earned nothing and could be
+    /// pruned by any stranger -- which also destroyed a matured streak, because registering again
+    /// restarts the clock. Carving it out does not reopen what this check is for: code deployed at a
+    /// CREATE2 address is not a 23-byte stub, so it still trips. A delegate that answers `token0()` with
+    /// PIMD is still caught, by `_isPool` at `register` and `prune`, exactly as any other contract is.
     function _shapeChanged(address a, Holder storage h) internal view returns (bool) {
-        return h.vettedCodeless && a.code.length != 0;
+        if (!h.vettedCodeless) return false;
+        uint256 len = a.code.length;
+        return len != 0 && !(len == 23 && _isDelegationStub(a));
+    }
+
+    /// True when the first three bytes of `a`'s code are EIP-7702's `0xef0100` marker. Only ever called
+    /// when the code is already known to be 23 bytes long, which is that marker plus one address.
+    function _isDelegationStub(address a) internal view returns (bool ok) {
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, 0)
+            extcodecopy(a, ptr, 0, 3)
+            ok := eq(shr(232, mload(ptr)), 0xef0100)
+        }
     }
 
     /// True for a contract that reports PIMD as either side of a pair: a rogue V2/V3-style pool must not collect

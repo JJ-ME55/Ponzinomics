@@ -448,7 +448,10 @@ contract PimdHook is IHooks, IUnlockCallback {
         _tstore(_UNLOCK_SLOT, 0);
 
         totalToHolders += toHolders;
-        totalToTeam += toTeam;
+        // Net of the tip, because that is what the team actually received. Booking the gross overstated
+        // it by every outside caller's tip, compounding on every flush, and the engine's own path was
+        // only the loud half of that. The `Flushed` event still carries both numbers.
+        totalToTeam += toTeam - tip;
         emit Flushed(msg.sender, toHolders, toTeam, tip);
     }
 
