@@ -35,14 +35,15 @@ contract PimdToken is ERC20 {
     }
 
     /// @notice Lifetime PIMD destroyed, for the site's burn counter. Anyone can verify it: it is just the
-    /// balance sitting at an address nobody can spend from.
+    /// balance sitting at addresses nobody can spend from. Counts the zero address as well as DEAD,
+    /// because a plain ERC-20 transfer there is allowed and is just as final.
     function totalBurned() external view returns (uint256) {
-        return balanceOf[DEAD];
+        return balanceOf[DEAD] + balanceOf[address(0)];
     }
 
     /// @notice Supply that is still spendable by somebody. `totalSupply` never falls, so this is the number
     /// that matters for scarcity, and the one the site and the oracle recipes should read.
     function circulatingSupply() external view returns (uint256) {
-        return INITIAL_SUPPLY - balanceOf[DEAD];
+        return INITIAL_SUPPLY - balanceOf[DEAD] - balanceOf[address(0)];
     }
 }

@@ -82,7 +82,6 @@ contract PimdHook is IHooks, IUnlockCallback {
 
     uint256 private constant _FEE_SLOT = uint256(keccak256("pimd.hook.fee")) - 1;
     uint256 private constant _UNLOCK_SLOT = uint256(keccak256("pimd.hook.unlocking")) - 1;
-    uint256 private constant _INSWAP_SLOT = uint256(keccak256("pimd.hook.inswap")) - 1;
     uint256 private constant _SPEC_SLOT = uint256(keccak256("pimd.hook.specified")) - 1;
 
     // ------------------------------------------------------------------ fixed wiring
@@ -271,7 +270,6 @@ contract PimdHook is IHooks, IUnlockCallback {
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         if (initBlock == 0) revert NotLaunched();
-        if (_tload(_INSWAP_SLOT) == 1) return (IHooks.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
         if (L2Block.number() == initBlock) revert InitBlockSwap();
 
         uint256 fee;
@@ -295,7 +293,6 @@ contract PimdHook is IHooks, IUnlockCallback {
         onlyPoolManager
         returns (bytes4, int128)
     {
-        if (_tload(_INSWAP_SLOT) == 1) return (IHooks.afterSwap.selector, 0);
         uint256 fee = _tload(_FEE_SLOT);
         uint256 specified = _tload(_SPEC_SLOT);
         _tstore(_FEE_SLOT, 0);
