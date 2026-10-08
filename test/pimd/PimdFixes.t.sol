@@ -499,6 +499,107 @@ contract PimdFixesTest is PimdBaseTest {
         engine.register(one);
     }
 
+    // ================================================================= tip economics
+    /// Adversarial finding 1, high. The budget used to be drawn in call order -- fire, then tally, then
+    /// pay -- so the end of the queue starved. `pay` is the call holders actually need, costs 11.8M gas at
+    /// the launch bound, and nobody is obliged to make it; at a 20,000 IMD pot with 700 holders it earned
+    /// nothing at all. Each phase now draws only down to the floor reserved for the phases after it.
+    ///
+    /// The epoch below is deliberately shaped so that first-come would give the firer everything: a small
+    /// pot and the minimum interval, so 5% of the drip is less than `fireTip` on its own.
+    function test_pay_is_funded_even_when_the_firer_could_take_the_lot() public {
+        _pastLaunchCap();
+        _buy(alice, 200e18);
+        _buy(bob, 200e18);
+        _register(alice);
+        _register(bob);
+        vm.warp(vm.getBlockTimestamp() + 2 days); // matured, so the epoch weighs something
+        _runEpoch(); // sets lastFire, so the next epoch's elapsed time is short
+
+        _buy(carol, 50e18); // a little income back into the pot
+        vm.warp(vm.getBlockTimestamp() + 2 minutes); // exactly minInterval: a small drip
+
+        address firer = makeAddr("tipFirer");
+        address payer = makeAddr("tipPayer");
+
+        vm.prank(firer);
+        engine.fire();
+        uint256 budget = engine.epochTipBudget();
+        assertGt(budget, 0, "there is a budget to share out");
+        assertLt(budget, engine.fireTip(), "and it is smaller than fireTip, so first come would eat it all");
+
+        uint256 keeperBefore = imd.balanceOf(keeper);
+        vm.prank(keeper);
+        engine.tally(500);
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Pay), "the epoch weighs something");
+        uint256 keeperGot = imd.balanceOf(keeper) - keeperBefore;
+
+        vm.prank(payer);
+        engine.pay(500);
+
+        assertGt(imd.balanceOf(payer), 0, "the payer was paid");
+        assertGt(imd.balanceOf(firer), 0, "and so was the firer");
+        assertGt(keeperGot, 0, "and the tally, out of its own share");
+        assertLe(imd.balanceOf(firer), budget / 10 + 1, "the firer could not take more than a tenth");
+        assertGt(engine.totalDripped(), 0, "and the holders were actually paid");
+    }
+
+    /// Adversarial finding 3, medium. `fire` paid `fireTip` on the spot, before anything had been weighed
+    /// and before anything could know the epoch was worthless, so a caller could sit on a run of null
+    /// epochs and take a tip from the pot for each -- 9 IMD over six hours in the reviewer's measurement,
+    /// with nothing distributed. The firer is now recorded and paid by `tally`, and only if it weighs.
+    function test_a_null_epoch_pays_the_firer_nothing() public {
+        _pastLaunchCap();
+        _buy(alice, 300e18);
+        vm.prank(keeper);
+        hook.flush();
+        vm.warp(vm.getBlockTimestamp() + 6 hours);
+
+        _buy(carol, 300e18);
+        _register(carol); // this second, so tier 0 and the whole set weighs nothing
+        address firer = makeAddr("nullFirer");
+
+        uint256 potBefore = engine.pot();
+        vm.prank(firer);
+        engine.fire();
+        assertEq(engine.epochFirer(), firer, "the firer is recorded, not paid");
+        assertEq(imd.balanceOf(firer), 0, "nothing paid at fire");
+        assertGt(engine.epochTipBudget(), engine.fireTip(), "and the budget could have covered it");
+
+        vm.prank(keeper);
+        engine.tally(500);
+        assertEq(uint8(engine.phase()), uint8(PimdEngine.Phase.Idle), "the null epoch closed");
+        assertEq(engine.totalDripped(), 0, "distributing nothing");
+        assertEq(imd.balanceOf(firer), 0, "so the firer is paid nothing at all");
+        assertEq(engine.tipBudget(), 0, "and the budget is closed out");
+        assertGe(engine.pot(), potBefore, "the pot did not shrink");
+    }
+
+    /// And the firer is the one paid, not whoever happens to run the tally.
+    function test_the_firer_is_paid_not_the_tallier() public {
+        _pastLaunchCap();
+        _buy(alice, 300e18);
+        _register(alice);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+
+        address firer = makeAddr("realFirer");
+        vm.prank(firer);
+        engine.fire();
+        assertEq(engine.epochFirer(), firer);
+        assertEq(imd.balanceOf(firer), 0, "not paid yet");
+
+        uint256 budget = engine.epochTipBudget();
+        vm.prank(keeper);
+        engine.tally(500);
+
+        // `fireTip` is a ceiling, not a guarantee: firing is 165k gas of work against a 26M gas tally, so
+        // the fire floor caps it at a tenth of the epoch's budget whenever that is the smaller number.
+        uint256 expected = engine.fireTip() < budget / 10 ? engine.fireTip() : budget / 10;
+        assertGt(expected, 0, "there was something to pay");
+        assertApproxEqAbs(imd.balanceOf(firer), expected, 1, "the firer was paid, at tally, up to its cap");
+        assertGt(imd.balanceOf(keeper), 0, "and the tallier got its own tip");
+    }
+
     function _cfg(uint256 maxHolders_) internal view returns (PimdEngine.Config memory) {
         return PimdEngine.Config({
             poolManager: address(manager),

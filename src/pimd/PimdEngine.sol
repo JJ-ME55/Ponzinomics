@@ -66,6 +66,14 @@ contract PimdEngine is ReentrancyGuard {
     /// Addresses below this are precompiles. None of them can forward an IMD payout.
     uint160 internal constant PRECOMPILE_CEILING = 0x100;
     uint256 internal constant TIP_BUDGET_BPS = 500; // keeper tips never exceed 5% of an epoch's drip
+    /// The budget is shared out by phase rather than first come. It used to be drawn in call order --
+    /// `fire`, then `tally`, then `pay` -- which starved the end of the queue: at a 20,000 IMD pot with
+    /// 700 holders the firer and the tally took the lot and `pay`, an 11.8M gas whole-set transfer loop,
+    /// earned nothing at all until the drip passed 43 IMD. `pay` is the call holders actually need, and
+    /// nobody is obliged to make it, so it must not be the one left unpaid. Each phase may now draw only
+    /// down to the floor reserved for the phases after it.
+    uint256 internal constant FIRE_TIP_FLOOR_BPS = 9_000; // `fire` may take at most a tenth
+    uint256 internal constant TALLY_TIP_FLOOR_BPS = 4_500; // `tally` may not touch `pay`'s 45%
     /// @dev How long an epoch may stay open before anyone may abandon it. The engine has no owner, so this
     /// is the only thing standing between an epoch that cannot finish and an engine that never pays again.
     uint256 internal constant ABORT_DELAY = 1 days;
@@ -169,6 +177,13 @@ contract PimdEngine is ReentrancyGuard {
     uint256 internal epochPaidHolders;
     uint256 internal epochPaidQuote; // IMD actually paid out so far this epoch
     uint256 public tipBudget; // what is left of this epoch's keeper tips
+    uint256 public epochTipBudget; // what it was when the epoch opened, which the floors are shares of
+    /// @notice Who fired the running epoch, and who is paid for it once the epoch proves to be worth
+    /// something. `fire` used to pay on the spot, before anything had been weighed and before anything
+    /// could know the epoch was worthless, so a caller could sit on an endless run of null epochs and
+    /// take a tip from the pot for each one -- measured at 9 IMD over six hours, with nothing
+    /// distributed and the keeper tallying 180 times for free.
+    address public epochFirer;
 
     // ------------------------------------------------------------------ events
     event Bound(address indexed token, address indexed hook);
@@ -385,7 +400,8 @@ contract PimdEngine is ReentrancyGuard {
 
     // ================================================================== the epoch
     /// @notice Pulls whatever the hook is holding, books it as income, releases this epoch's slice of the pot
-    /// and opens a distribution. Permissionless; pays `fireTip` to the caller out of the epoch's tip budget.
+    /// and opens a distribution. Permissionless. The caller is recorded as the firer and paid `fireTip`
+    /// by `tally`, if and only if the epoch turns out to weigh something.
     function fire() external nonReentrant {
         if (!bound) revert NotBound();
         if (phase != Phase.Idle) revert WrongPhase();
@@ -429,7 +445,9 @@ contract PimdEngine is ReentrancyGuard {
         epochPaidHolders = 0;
         lastFire = block.timestamp;
         tipBudget = (drip * TIP_BUDGET_BPS) / BPS;
-        _tip(fireTip);
+        epochTipBudget = tipBudget;
+        // Recorded, not paid: the firer collects in `tally`, and only if the epoch weighs something.
+        epochFirer = msg.sender;
     }
 
     /// @notice First pass: reads every registered holder's PIMD balance, updates the hold streak and records
@@ -526,8 +544,11 @@ contract PimdEngine is ReentrancyGuard {
                 return;
             }
             phase = Phase.Pay;
+            // The epoch is worth something, so the firer is owed. Paid here rather than in `fire`,
+            // and before the tally's own tip, because firing came first.
+            _tipTo(epochFirer, fireTip, FIRE_TIP_FLOOR_BPS);
         }
-        _tip(tipPerHolder * (end - start));
+        _tipTo(msg.sender, tipPerHolder * (end - start), TALLY_TIP_FLOOR_BPS);
     }
 
     /// @notice Second pass: pays each holder their share of this epoch's IMD.
@@ -575,7 +596,7 @@ contract PimdEngine is ReentrancyGuard {
             epochPaidQuote = 0;
             emit EpochPaid(epoch, epochPaidHolders == 0 ? 0 : total - leftover, epochPaidHolders);
         }
-        _tip(tipPerHolder * (end - start));
+        _tipTo(msg.sender, tipPerHolder * (end - start), 0);
     }
 
     /// @notice Abandons an epoch that has been open for a day without finishing. Permissionless, unpaid.
@@ -699,13 +720,19 @@ contract PimdEngine is ReentrancyGuard {
 
     /// Pays the caller from the pot, but only out of this epoch's tip budget (5% of what the epoch released),
     /// so a quiet market or a spammy caller can never turn keeper tips into a drain on holders.
-    function _tip(uint256 amt) internal {
+    /// Pays `to` up to `amt`, but never below the share of this epoch's budget that `floorBps` reserves
+    /// for the phases still to come. A failed send puts everything back, so a recipient that refuses IMD
+    /// forfeits its tip rather than taking the epoch down with it.
+    function _tipTo(address to, uint256 amt, uint256 floorBps) internal {
         uint256 budget = tipBudget;
-        if (amt > budget) amt = budget;
+        uint256 floor = (epochTipBudget * floorBps) / BPS;
+        if (budget <= floor) return;
+        uint256 room = budget - floor;
+        if (amt > room) amt = room;
         if (amt == 0 || pot < amt) return;
         tipBudget = budget - amt;
         pot -= amt;
-        if (!_send(msg.sender, amt)) {
+        if (!_send(to, amt)) {
             pot += amt;
             tipBudget = budget;
         }

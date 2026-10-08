@@ -59,7 +59,14 @@ contract DeployPimd is Script {
             team: team,
             binder: binder,
             dripBpsPerPeriod: vm.envOr("DRIP_BPS", production ? uint256(150) : uint256(400)),
-            minInterval: vm.envOr("MIN_INTERVAL", uint256(2 minutes)),
+            // The only parameter here that was not gated on `production`, which meant the testnet
+            // floor of two minutes shipped against a six-hour `maxCatchup`. `fire` is permissionless,
+            // so whoever polls hardest owns the cadence, and at two minutes a bot could hold the drip
+            // to 0.2% a shot while making the keeper run a whole-set tally 720 times a day: 8.35
+            // billion gas against 46.4M for the same IMD. 15 minutes is `PERIOD`, the rate the drip is
+            // quoted in, so firing faster than this only slices one release into smaller pieces at
+            // full per-epoch cost.
+            minInterval: vm.envOr("MIN_INTERVAL", production ? uint256(15 minutes) : uint256(2 minutes)),
             minBalance: vm.envOr("MIN_BALANCE", production ? uint256(1_000_000e18) : uint256(100_000e18)),
             fireTip: vm.envOr("FIRE_TIP", production ? uint256(0.05e18) : uint256(0.01e18)),
             tipPerHolder: vm.envOr("TIP_PER_HOLDER", production ? uint256(0.003e18) : uint256(0.0001e18)),
@@ -97,6 +104,7 @@ contract DeployPimd is Script {
         console2.log("-- parameters actually deployed (check these against intent) --");
         console2.log("production  ", production);
         console2.log("dripBps     ", engine.dripBpsPerPeriod());
+        console2.log("minInterval ", engine.minInterval());
         console2.log("minBalance  ", engine.minBalance());
         console2.log("fireTip     ", engine.fireTip());
         console2.log("tipPerHolder", engine.tipPerHolder());
