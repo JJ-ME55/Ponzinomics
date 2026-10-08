@@ -79,6 +79,7 @@ contract PimdHook is IHooks, IUnlockCallback {
     uint256 private constant _FEE_SLOT = uint256(keccak256("pimd.hook.fee")) - 1;
     uint256 private constant _UNLOCK_SLOT = uint256(keccak256("pimd.hook.unlocking")) - 1;
     uint256 private constant _INSWAP_SLOT = uint256(keccak256("pimd.hook.inswap")) - 1;
+    uint256 private constant _SPEC_SLOT = uint256(keccak256("pimd.hook.specified")) - 1;
 
     // ------------------------------------------------------------------ fixed wiring
     /// @dev The launch factory constructs this hook with the pool manager and the token and nothing else, so
@@ -153,6 +154,7 @@ contract PimdHook is IHooks, IUnlockCallback {
     error PoolMustPairToken();
     error WrongStartingPrice(int24 got, int24 expected);
     error LiquidityIsLocked();
+    error PartialFill(uint256 wanted, uint256 filled);
     error NotLaunchFactory();
     error WrongQuoteCurrency(address got);
     error NotLaunched();
@@ -276,6 +278,9 @@ contract PimdHook is IHooks, IUnlockCallback {
             uint256 bps = params.zeroForOne ? BUY_TAX_BPS : SELL_TAX_BPS;
             fee = params.amountSpecified < 0 ? amt * bps / BPS : amt * bps / (BPS - bps);
             if (fee > 0) poolManager.mint(address(this), quoteId, fee);
+            // Remember what was asked for. The fee is computed here, before the pool decides how much it
+            // can actually fill, so afterSwap has to check the two were the same.
+            _tstore(_SPEC_SLOT, amt);
         }
         _tstore(_FEE_SLOT, fee);
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(uint128(fee)), 0), 0);
@@ -288,8 +293,22 @@ contract PimdHook is IHooks, IUnlockCallback {
     {
         if (_tload(_INSWAP_SLOT) == 1) return (IHooks.afterSwap.selector, 0);
         uint256 fee = _tload(_FEE_SLOT);
+        uint256 specified = _tload(_SPEC_SLOT);
         _tstore(_FEE_SLOT, 0);
+        _tstore(_SPEC_SLOT, 0);
         int128 hookDeltaUnspecified;
+
+        // When IMD is the specified side the tax was taken in beforeSwap, against the amount asked for,
+        // before the pool knew how much of it would fill. A swap stopped by its price limit or by the end
+        // of the range would then pay the full tax on IMD that never traded. Refusing it is the only
+        // honest option here: V4 lets afterSwap return a delta on the unspecified side only, so the
+        // overcharge cannot be handed back in IMD. The swapper loses nothing and simply tries again.
+        if (specified != 0) {
+            int128 a0q = delta.amount0();
+            uint256 movedQuote = a0q < 0 ? uint256(uint128(-a0q)) : uint256(uint128(a0q));
+            uint256 wanted = params.amountSpecified < 0 ? specified - fee : specified + fee;
+            if (movedQuote != wanted) revert PartialFill(wanted, movedQuote);
+        }
 
         // The other two cases: the IMD side is the *unspecified* amount, known only now.
         if ((params.amountSpecified < 0) != params.zeroForOne) {

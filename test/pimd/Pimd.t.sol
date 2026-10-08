@@ -86,6 +86,32 @@ contract PimdTest is PimdBaseTest {
         assertApproxEqRel(fee, want * 560 / 9440, 1e12, "the sell tax, on top of what was asked for");
     }
 
+    /// Audit finding, MEDIUM: the tax on an exact-in buy is computed in beforeSwap from the amount asked
+    /// for, before the pool knows how much will fill. A swap stopped by its price limit used to pay the
+    /// full tax on IMD that never traded: 24 IMD of tax on a 1000 IMD offer that filled a sliver.
+    function test_a_partially_filled_buy_is_refused_rather_than_overtaxed() public {
+        _pastLaunchCap();
+        _buy(alice, 10e18); // put some IMD in the pool and move the price off the opening tick
+
+        (uint160 spot,,,) = StateLibrary.getSlot0(manager, id);
+        uint256 taxedBefore = hook.totalTaxed();
+        _fund(bob, 1000e18);
+        vm.prank(bob, bob);
+        vm.expectRevert(); // PartialFill, wrapped by the PoolManager
+        router.swap(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -int256(1000e18),
+                sqrtPriceLimitX96: spot - spot / 20000 // a limit the offer cannot fill against
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertEq(hook.totalTaxed(), taxedBefore, "nothing was taxed on a swap that did not happen");
+        assertEq(imd.balanceOf(bob), 1000e18, "bob keeps every IMD");
+    }
+
     // ------------------------------------------------------------------ the split
     function test_tax_splits_seventy_five_twenty_five() public {
         _pastLaunchCap();
