@@ -63,6 +63,7 @@ contract DeployPimd is Script {
         console2.log("binder      ", binder);
         console2.log("");
         console2.log("Next: write this address into PimdHook.ENGINE_ADDRESS, push, then quote the launch.");
-        console2.log("After the launch lands, the binder calls engine.bind(token, hook).");
+        console2.log("After the launch lands, the binder calls engine.bind(token, hook, [distributor]).");
+        console2.log("The airdrop distributor MUST be in that list, or it earns drips nobody can claim.");
     }
 }

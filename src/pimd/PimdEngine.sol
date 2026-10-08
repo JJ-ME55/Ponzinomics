@@ -134,6 +134,7 @@ contract PimdEngine is ReentrancyGuard {
 
     // ------------------------------------------------------------------ events
     event Bound(address indexed token, address indexed hook);
+    event Excluded(address indexed account);
     event Seeded(address indexed from, uint256 amount);
     event Income(uint256 amount);
     event Fired(uint256 indexed epoch, uint256 imdForHolders, uint256 holderCount);
@@ -171,9 +172,14 @@ contract PimdEngine is ReentrancyGuard {
     }
 
     // ================================================================== one-time setup
-    /// @notice Links the engine to its token and hook. Callable once, by the binder named at construction, after the hook
-    /// has launched the pool with this engine as its payout target.
-    function bind(address token_, address hook_) external {
+    /// @notice Links the engine to its token and hook. Callable once, by the binder named at construction,
+    /// after the pool is open.
+    /// @param alsoExclude addresses that hold PIMD but must never be paid. The launch factory's airdrop
+    /// distributor is the one that matters: it holds a tenth of the supply until people claim, it is not
+    /// pool-shaped so `_isPool` does not see it, and nothing in it can forward an IMD payout, so every
+    /// drip it received would be stranded in a contract forever. Its address is only known once the launch
+    /// has happened, which is why this is an argument rather than a constant.
+    function bind(address token_, address hook_, address[] calldata alsoExclude) external {
         if (msg.sender != binder) revert NotBinder();
         if (bound) revert AlreadyBound();
         if (token_ == address(0) || hook_ == address(0)) revert BadConfig();
@@ -185,6 +191,11 @@ contract PimdEngine is ReentrancyGuard {
         address[6] memory ex = [hook_, address(poolManager), address(this), team, address(0), DEAD];
         for (uint256 i; i < ex.length; ++i) {
             excluded[ex[i]] = true;
+        }
+        for (uint256 i; i < alsoExclude.length; ++i) {
+            if (alsoExclude[i] == address(0)) continue;
+            excluded[alsoExclude[i]] = true;
+            emit Excluded(alsoExclude[i]);
         }
         emit Bound(token_, hook_);
     }

@@ -367,6 +367,44 @@ contract PimdTest is PimdBaseTest {
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
     }
 
+    /// The launch policy airdrops a tenth of the supply through a MerkleDistributor. It is not
+    /// pool-shaped, so _isPool does not see it, and it has no way to forward an IMD payout: anything
+    /// dripped to it is stranded in a contract forever. It has to be excluded at bind.
+    function test_an_excluded_holder_is_never_registered_or_paid() public {
+        _pastLaunchCap();
+        address distributor = makeAddr("distributor");
+
+        PimdEngine fresh = new PimdEngine(
+            PimdEngine.Config({
+                poolManager: address(manager),
+                imd: address(imd),
+                team: team,
+                binder: address(this),
+                dripBpsPerPeriod: 400,
+                minInterval: 2 minutes,
+                minBalance: 100_000e18,
+                fireTip: 0,
+                tipPerHolder: 0,
+                maxCatchup: 6 hours
+            })
+        );
+        address[] memory extra = new address[](1);
+        extra[0] = distributor;
+        fresh.bind(address(token), address(hook), extra);
+        assertTrue(fresh.excluded(distributor), "named at bind");
+
+        // give it a real bag, the way the airdrop would
+        _buy(alice, 300e18);
+        uint256 bag = token.balanceOf(alice);
+        vm.prank(alice);
+        token.transfer(distributor, bag);
+
+        address[] memory one = new address[](1);
+        one[0] = distributor;
+        fresh.register(one);
+        assertEq(fresh.holderCount(), 0, "an excluded address cannot register, however big its bag");
+    }
+
     // ------------------------------------------------------------------ the liquidity lock
     /// Audit finding, MEDIUM, found by three specialists: the single permitted add went to whoever was
     /// first, so one wei from a stranger consumed it and the factory's real seed reverted.
@@ -414,7 +452,7 @@ contract PimdTest is PimdBaseTest {
 
     function test_bind_is_one_shot() public {
         vm.expectRevert(PimdEngine.AlreadyBound.selector);
-        engine.bind(address(token), address(hook));
+        engine.bind(address(token), address(hook), new address[](0));
     }
 
     function test_hook_refuses_raw_eth() public {

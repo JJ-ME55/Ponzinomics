@@ -124,7 +124,7 @@ contract PimdForkTest is Test {
         );
         token.transfer(address(factory), seed);
         factory.seed(k, TICK_LOWER, START_TICK, liquidity);
-        engine.bind(address(token), address(hook));
+        engine.bind(address(token), address(hook), new address[](0));
         key = hook.poolKey();
 
         // Nothing here advances the block: a roll or an etch done in setUp does not reach the test body

@@ -275,9 +275,9 @@ contract PimdAttacksTest is PimdBaseTest {
         assertEq(fresh.binder(), address(this), "the deploy names who may bind");
         vm.prank(stranger);
         vm.expectRevert(PimdEngine.NotBinder.selector);
-        fresh.bind(address(token), address(hook));
+        fresh.bind(address(token), address(hook), new address[](0));
 
-        fresh.bind(address(token), address(hook)); // and we can
+        fresh.bind(address(token), address(hook), new address[](0)); // and we can
         assertTrue(fresh.bound(), "bound by the named binder");
         assertEq(fresh.team(), team, "fees still point at our wallet, whoever deployed");
     }

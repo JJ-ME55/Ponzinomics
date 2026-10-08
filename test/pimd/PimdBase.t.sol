@@ -210,7 +210,7 @@ abstract contract PimdBaseTest is Test {
         require(address(hook) == hookAddr, "hook addr");
 
         _openPoolAsFactory();
-        engine.bind(address(token), address(hook));
+        engine.bind(address(token), address(hook), new address[](0));
         key = hook.poolKey();
         id = key.toId();
     }
