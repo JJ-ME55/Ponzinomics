@@ -57,8 +57,10 @@ contract DeployPimd is Script {
             tipPerHolder: vm.envOr("TIP_PER_HOLDER", production ? uint256(0.003e18) : uint256(0.0001e18)),
             maxCatchup: vm.envOr("MAX_CATCHUP", production ? uint256(6 hours) : uint256(1 hours)),
             // `tally` weighs the whole holder set in one call, so the set is bounded. 1,200 against a
-            // measured 13.5k gas per holder is about 16M, comfortably inside a single transaction, and
-            // `register` refuses past it rather than letting an epoch become unweighable.
+            // measured 34.6k gas per holder is about 42M, which Robinhood Chain takes without noticing
+            // (its block limit is 2^50), and `register` refuses past it rather than letting an epoch
+            // become unweighable. The minimum bag is a tenth of a percent of supply, so at most 1,000
+            // addresses can qualify at once and this cap is never the thing that binds.
             maxHolders: vm.envOr("MAX_HOLDERS", uint256(1_200))
         });
 

@@ -90,7 +90,7 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// getters purely so tests can point them at local doubles; the production path returns these constants.
     address internal constant TEAM_WALLET = 0x0960E8Bd80462e3842Bb6620c7C5289A44c4559B;
     /// @dev The engine is deployed by us before the launch request goes out, and its address written here.
-    address internal constant ENGINE_ADDRESS = 0x92A9ABEB52031D529AB1ae3638CA073fa12Be01d;
+    address internal constant ENGINE_ADDRESS = 0x8974d07239e6D8B843eE70725823E7e95CbB6924;
     /// @dev IMD on Robinhood Chain. Every fee calculation, the ERC-6909 claim id and the engine's booking all
     /// assume the quote is this token specifically, so the pool is refused if it is anything else.
     address internal constant QUOTE_TOKEN = 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127;
