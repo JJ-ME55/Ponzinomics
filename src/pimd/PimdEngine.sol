@@ -72,7 +72,7 @@ contract PimdEngine is ReentrancyGuard {
     /// earned nothing at all until the drip passed 43 IMD. `pay` is the call holders actually need, and
     /// nobody is obliged to make it, so it must not be the one left unpaid. Each phase draws only down to
     /// the floor reserved for the phases after it, and inside `pay` each page draws only its pro-rata
-    /// slice of what is left, so finishing an epoch is always the best-paid page rather than the worst.
+    /// slice of what is left, which pays every page the same rate per holder however it is sliced.
     ///
     /// What these floors do NOT do is ration between actors: they order the draw, so one address holding
     /// several roles collects every share it turns up for. The only ceiling against that is the
@@ -483,8 +483,18 @@ contract PimdEngine is ReentrancyGuard {
     /// PoolManager guard alone could not: that guard only sees Uniswap V4, so a flash loan from anywhere
     /// else, or a one-block OTC loan, stood outside it. Under a whole-set loop each holder is read exactly
     /// once, so a bag that was not already there at the previous tally carries no weight however large it
-    /// is. The deliberate cost: tokens must survive one epoch before they earn, so a fresh buy waits a
-    /// single epoch. Selling is unchanged and still restarts the streak immediately.
+    /// is. The deliberate cost: a bag added to an address already in the set waits a count before it
+    /// earns.
+    ///
+    /// Two things this does NOT say, because earlier versions of this note said them and they are not
+    /// true. A freshly registered address is not made to wait: `register` writes `lastBal` from the
+    /// balance at the registrant's own instant, so at the next count `bal == lastBal` and the whole bag
+    /// is weighed, subject only to the hour at tier 0. The bag has to be present at registration and at
+    /// one count, not continuously between them. And selling does not restart the streak on its own: the
+    /// clock restarts only where a count finds the balance lower than the last count did, so a bag that
+    /// leaves and comes back between two counts neither resets nor blends -- the engine cannot tell it
+    /// from a bag that never moved. Both follow from reading balances per epoch rather than per
+    /// transfer, which is what makes a PIMD transfer cost what any ERC-20 transfer costs.
     ///
     /// `_isPool` is deliberately not called here. It staticcalls an address the holder controls, and a
     /// contract that burns both probes cost about 58k gas per slot against 13.5k for a plain holder, which
@@ -498,12 +508,12 @@ contract PimdEngine is ReentrancyGuard {
     /// an address CREATE2 chose could be registered empty, left to mature a streak, and only then given
     /// pair code. Re-probing would catch it and cannot be afforded; noticing that code arrived where there
     /// was none is nearly free, and takes the weight away the same epoch.
-    function tally(uint256 maxHolders) external nonReentrant {
+    function tally(uint256 pageSize) external nonReentrant {
         if (!keeper[msg.sender]) revert NotKeeper();
         if (phase != Phase.Tally) revert WrongPhase();
         _requireLocked();
         uint256 start = cursor;
-        if (start != 0 || maxHolders < epochCount) revert TallyMustBeWhole(epochCount);
+        if (start != 0 || pageSize < epochCount) revert TallyMustBeWhole(epochCount);
         uint256 end = epochCount;
         uint256 tw = totalWeight;
         uint256 nowTs = block.timestamp;
@@ -541,12 +551,10 @@ contract PimdEngine is ReentrancyGuard {
                 // be paid out of. Closing the budget as well stops the rest of it being spent on an
                 // epoch that never reaches `pay`.
                 //
-                // This does NOT make a null epoch free. `fire` paid `fireTip` at the top, before
-                // anything had been weighed and before anything could know the epoch was worthless,
-                // and that is gone from the pot. `fire` is permissionless while this is keeper-only,
-                // so the two are not even the same caller. `lastFire` has advanced too, so the
-                // window's release is deferred rather than lost. Bounded by `minInterval` and by the
-                // same 5% budget, but not closed.
+                // A null epoch costs the pot nothing at all. `fire` pays no tip -- it only records
+                // `epochFirer` -- and the firer is paid below, on the path this branch returns before,
+                // so an epoch that weighs nothing pays nobody. `lastFire` has still advanced, so the
+                // window's release is deferred rather than lost.
                 tipBudget = 0;
                 return;
             }
@@ -559,11 +567,11 @@ contract PimdEngine is ReentrancyGuard {
     }
 
     /// @notice Second pass: pays each holder their share of this epoch's IMD.
-    function pay(uint256 maxHolders) external nonReentrant {
+    function pay(uint256 pageSize) external nonReentrant {
         if (phase != Phase.Pay) revert WrongPhase();
         _requireLocked();
         uint256 start = cursor;
-        uint256 end = start + maxHolders;
+        uint256 end = start + pageSize;
         if (end > epochCount) end = epochCount;
         // The epoch's total and its weight denominator are both frozen, so a holder's share does not depend on
         // which page it lands in, or on whether an earlier payout failed.
@@ -613,8 +621,11 @@ contract PimdEngine is ReentrancyGuard {
         // three epochs while holder 0 was paid in each.
         //
         // A page covering `n` of the `m` holders still uncovered may therefore draw at most `n / m` of
-        // what is left. The last page has `n == m` and so can still take the remainder, which is what
-        // keeps finishing an epoch the best-paid thing to do rather than the worst.
+        // what is left. That is flat rather than generous to the finisher, and deliberately so: taking
+        // `B * n / m` leaves `B * (m - n) / m` for `m - n` holders, so the budget per uncovered holder
+        // is invariant and every page earns the same rate, first or last. Nothing to gain by taking a
+        // cheap page, nothing to lose by finishing. The last page has `n == m`, so it takes the
+        // remainder and strands none of it.
         if (end > start) {
             uint256 want = tipPerHolder * (end - start);
             uint256 share = (tipBudget * (end - start)) / (epochCount - start);
