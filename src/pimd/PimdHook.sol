@@ -40,7 +40,9 @@ interface IERC20Quote {
 ///
 /// The pool is opened and seeded by the IMD launch factory, not by this contract, single-sided in PIMD. This
 /// hook's job at launch is to refuse a pool that would be wrong: `beforeInitialize` is the only gate, and it
-/// checks the caller, the pairing, the quote currency, the fee tier and the opening price.
+/// checks the caller, the pairing, the quote currency and the fee tier. It does NOT check the opening price:
+/// the factory sets that from the chain policy and the pad's admission harness requires the hook to accept
+/// the pool it opens, so `LAUNCH_TICK` records what the policy implies without enforcing it.
 ///
 /// @dev This is PULSE v1's hook with the quote asset changed from native ETH to an ERC-20, the emissions
 /// removed, and the launch handed to the factory. Things that deserve an audit's attention: fee claims are

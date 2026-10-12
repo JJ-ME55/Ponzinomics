@@ -554,6 +554,51 @@ contract PimdTest is PimdBaseTest {
         fresh = PimdHook(payable(address(new PimdHookHarness{salt: salt2}(manager, address(t), address(engine), team, address(imd), address(factory)))));
     }
 
+    /// Launches 1405 and 1414 both parked on `protected_invariants` with the same generic message, and the
+    /// $factory fix is proven to have landed (1414's generated manifest reads
+    /// ["$poolManager","$token","$factory"]). So the remaining refusal has to be the currency ordering. This
+    /// reproduces it: a token that sorts BELOW IMD makes the pool PIMD/IMD rather than IMD/PIMD, and
+    /// `beforeInitialize` refuses it. The pad decides where the token lands, so this is not ours to control.
+    function test_a_token_below_imd_can_never_open_the_pool() public {
+        bytes32 initHash = keccak256(type(PimdToken).creationCode);
+        PimdToken low;
+        for (uint256 i = 1; i < 400_000; ++i) {
+            address predicted = vm.computeCreate2Address(bytes32(i), initHash, address(this));
+            if (uint160(predicted) < uint160(address(imd))) {
+                low = new PimdToken{salt: bytes32(i)}();
+                break;
+            }
+        }
+        require(address(low) != address(0), "no salt below IMD");
+        assertLt(uint160(address(low)), uint160(address(imd)), "the token sorts below IMD");
+
+        bytes memory args =
+            abi.encode(manager, address(low), address(engine), team, address(imd), address(factory));
+        (, bytes32 salt2) = HookMiner.find(address(this), HOOK_FLAGS, type(PimdHookHarness).creationCode, args);
+        PimdHook fresh = PimdHook(
+            payable(
+                address(
+                    new PimdHookHarness{salt: salt2}(
+                        manager, address(low), address(engine), team, address(imd), address(factory)
+                    )
+                )
+            )
+        );
+
+        // Sorted the way V4 requires: the lower address is currency0, so PIMD lands there.
+        PoolKey memory k = PoolKey({
+            currency0: Currency.wrap(address(low)),
+            currency1: Currency.wrap(address(imd)),
+            fee: 12_500,
+            tickSpacing: SPACING,
+            hooks: IHooks(address(fresh))
+        });
+        vm.prank(address(factory));
+        vm.expectRevert();
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
+        assertFalse(fresh.launched(), "the pool did not open");
+    }
+
     function _keyFor(PimdHook h, PimdToken t, uint24 fee) internal view returns (PoolKey memory) {
         return PoolKey({
             currency0: Currency.wrap(address(imd)),

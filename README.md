@@ -48,10 +48,28 @@ and the pot goes on accruing — but the drip stops and nobody can appoint a rep
 
 ## What an auditor should look at first
 
-**The pool only works if IMD sorts below PIMD.** Everything in the hook assumes IMD is `currency0`. The deploy
-mines a CREATE2 salt so the token's address lands above IMD's, and `beforeInitialize` refuses to open a pool
-that gets it backwards, along with a second pool on this hook, a fee tier outside the permitted set, a pairing
-that is not PIMD, or an opening tick more than 300 from `LAUNCH_TICK`.
+**The pool only works if IMD sorts below PIMD, and nothing in this tree guarantees it.** Everything in the
+hook assumes IMD is `currency0`, and `beforeInitialize` refuses the other ordering. An earlier version of
+this file claimed the deploy mines a CREATE2 salt to put the token above IMD; it does not. The only salt
+mining here is test scaffolding in `test/pimd/PimdBase.t.sol`. Under a `univ4_hook` launch the **factory**
+deploys the token, wherever CREATE lands it.
+
+So roughly 37% of draws put PIMD below `0x5F7Bb593…`, and when that happens no `PoolKey` exists that this
+hook will accept: `PoolMustPairToken` on one ordering, `CurrenciesOutOfOrderOrEqual` from the PoolManager on
+the other, and the launch can never open. Measured on chain, 3 of the 14 live launches on Robinhood landed
+their token below IMD — including one `univ4_hook`, which could only open because that hook handles both
+orderings. This one does not, by choice: adapting would mean rewriting every fee calculation. It is a
+retry condition, not a defect, and it fails closed.
+
+`beforeInitialize` also refuses a second pool on this hook, a caller that is not the launch factory, a fee
+tier outside the permitted set, a pairing that is not PIMD and a quote that is not IMD. It does **not**
+refuse an opening price — see below.
+
+**The opening price is the factory's, not the hook's.** `LAUNCH_TICK` records what the chain policy's
+2,500 IMD cap implies, but `beforeInitialize` does not enforce it: the pad sets the price from policy and its
+admission harness requires the hook to accept the pool it opens. Measured on a live launch, the factory
+opened at tick 128939, a 2,515 IMD cap, so the policy and the constant agree in practice. The guarantee is
+the policy's, and it is one of the things to take on trust rather than read from the code.
 
 **The engine refuses to run while the PoolManager is unlocked.** Weights are read from `balanceOf`, and inside
 a V4 unlock anyone can hold an enormous balance for the length of one callback. `fire`, `tally`, `pay`,
