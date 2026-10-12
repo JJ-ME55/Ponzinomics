@@ -92,9 +92,47 @@ contract PimdRehearsal {
         hook = h;
     }
 
-    /// PIMD has to sort ABOVE IMD so IMD stays currency0, which every fee calculation in the hook assumes.
-    /// `beforeInitialize` refuses the other ordering outright, so a rehearsal that got this wrong would fail
-    /// at pool opening rather than quietly testing the wrong thing.
+    /// The mirror case, and the whole reason this exists: a token that sorts BELOW IMD, so V4 puts PIMD at
+    /// currency0 and IMD at currency1. The factory produces this about 37% of the time and it parked three
+    /// launches. The hook now takes it, and the rehearsal has to prove a real trade is still taxed the right
+    /// way round when it does.
+    function deployTokenBelow(address imd) external returns (address) {
+        bytes32 initHash = keccak256(type(PimdToken).creationCode);
+        for (uint256 i = 1; i < 400_000; ++i) {
+            bytes32 salt = bytes32(i);
+            address predicted =
+                address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, initHash)))));
+            if (uint160(predicted) < uint160(imd)) {
+                PimdToken t = new PimdToken{salt: salt}();
+                require(address(t) == predicted, "token create2");
+                token = address(t);
+                return token;
+            }
+        }
+        revert("no salt sorts below IMD");
+    }
+
+    /// What to open and seed with when PIMD is currency0. Mirrors `plan`: the range sits entirely ABOVE the
+    /// opening price so the position is all currency0, and the amount is therefore solved against currency0.
+    function planFlipped(address imd, int24 startTick, int24 tickUpper, uint256 amount)
+        external
+        view
+        returns (PoolKey memory key, uint160 sqrtPriceX96, uint128 liquidity)
+    {
+        key = PoolKey({
+            currency0: Currency.wrap(token),
+            currency1: Currency.wrap(imd),
+            fee: 12_500,
+            tickSpacing: 60,
+            hooks: IHooks(hook)
+        });
+        sqrtPriceX96 = TickMath.getSqrtPriceAtTick(startTick);
+        liquidity = LiquidityAmounts.getLiquidityForAmount0(
+            TickMath.getSqrtPriceAtTick(startTick), TickMath.getSqrtPriceAtTick(tickUpper), amount
+        );
+    }
+
+    /// PIMD sorting ABOVE IMD keeps IMD as currency0, the arrangement the hook was originally written for.
     function _deployTokenAbove(address imd) internal returns (address) {
         bytes32 initHash = keccak256(type(PimdToken).creationCode);
         for (uint256 i; i < 200_000; ++i) {
