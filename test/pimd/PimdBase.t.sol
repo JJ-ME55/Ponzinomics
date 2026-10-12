@@ -102,15 +102,13 @@ contract PimdHookHarness is PimdHook {
     address private immutable _engine;
     address private immutable _team;
     address private immutable _quote;
-    address private immutable _factory;
 
     constructor(IPoolManager pm, address token_, address engine_, address team_, address quote_, address factory_)
-        PimdHook(pm, token_)
+        PimdHook(pm, token_, factory_)
     {
         _engine = engine_;
         _team = team_;
         _quote = quote_;
-        _factory = factory_;
     }
 
     function engine() public view override returns (address) {
@@ -125,9 +123,6 @@ contract PimdHookHarness is PimdHook {
         return _quote;
     }
 
-    function launchFactory() public view override returns (address) {
-        return _factory;
-    }
 }
 
 contract MockArbSys {

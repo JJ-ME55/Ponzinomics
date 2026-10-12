@@ -67,8 +67,12 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// if the ArbSys precompile ever stopped answering, the block test alone would keep the cap on forever.
     uint256 public constant LAUNCH_CAP_MAX_SECONDS = 1 hours;
     /// @notice The tick the launch policy's 2,500 IMD opening cap implies on a one billion supply, with PIMD
-    /// as currency1: 2.5e-6 IMD per PIMD. Initialization is refused outside the tolerance, so a mispriced
-    /// pool fails loudly instead of opening.
+    /// as currency1: 2.5e-6 IMD per PIMD.
+    /// @dev INFORMATIONAL, NOT ENFORCED. `beforeInitialize` used to refuse anything outside the tolerance,
+    /// which is why launch 1405 could not open: the pad sets the opening price from the chain policy and
+    /// expects the hook to accept the pool it opens. These are kept because they record what the policy
+    /// implies and the front end reads them, but the pool's actual opening price is the factory's, not this
+    /// contract's. Read `Launched`'s tick for what it really opened at.
     int24 public constant LAUNCH_TICK = 129_000;
     int24 public constant LAUNCH_TICK_TOLERANCE = 300;
     /// @notice Fee tiers the launch factory is allowed to open this pool with.
@@ -94,10 +98,6 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// @dev IMD on Robinhood Chain. Every fee calculation, the ERC-6909 claim id and the engine's booking all
     /// assume the quote is this token specifically, so the pool is refused if it is anything else.
     address internal constant QUOTE_TOKEN = 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127;
-    /// @dev The launch factory, the only address allowed to open this pool and to seed it. PoolManager's
-    /// initialize is permissionless and this hook launches exactly once, so without this a stranger can
-    /// spend the launch on a pool of their choosing, or squat the single seed and brick the real one.
-    address internal constant LAUNCH_FACTORY = 0xA25B02A1e93903b790E6aaf7dA1b8B8d50294645;
 
     uint32 public constant launchCapSeconds = 600;
     uint32 public constant launchCapBlocks = 6_000;
@@ -110,6 +110,15 @@ contract PimdHook is IHooks, IUnlockCallback {
     // ------------------------------------------------------------------ immutables
     IPoolManager public immutable poolManager;
     IPimdToken public immutable token;
+    /// @dev The launch factory, the only address allowed to open this pool and to seed it. PoolManager's
+    /// initialize is permissionless and this hook launches exactly once, so without this a stranger can
+    /// spend the launch on a pool of their choosing, or squat the single seed and brick the real one.
+    ///
+    /// A constructor argument rather than a constant, because the launch factory is whatever the pad's
+    /// manifest resolves `$factory` to. Launch 1405 parked on exactly this: the hook refused
+    /// `initialize` from the factory the admission harness used, because the address was fixed at compile
+    /// time. Immutable, so it is still unchangeable after deployment.
+    address internal immutable LAUNCH_FACTORY;
 
     /// @notice The paired currency, learned from the pool key when the factory opens the pool.
     Currency public quote; // IMD
@@ -158,7 +167,6 @@ contract PimdHook is IHooks, IUnlockCallback {
     error AlreadyLaunched();
     error UnsupportedFeeTier(uint24 fee);
     error PoolMustPairToken();
-    error WrongStartingPrice(int24 got, int24 expected);
     error LiquidityIsLocked();
     error PartialFill(uint256 wanted, uint256 filled);
     error NotLaunchFactory();
@@ -194,10 +202,13 @@ contract PimdHook is IHooks, IUnlockCallback {
 
     /// @param pm the pool manager, passed by the launch factory as $poolManager
     /// @param token_ the PIMD token, passed by the launch factory as $token
-    constructor(IPoolManager pm, address token_) {
-        if (address(pm) == address(0) || token_ == address(0)) revert BadConfig();
+    /// @param factory_ the launch factory, passed by the launch factory as $factory. The only address that
+    ///        may open this pool or seed it, fixed here and unchangeable afterwards.
+    constructor(IPoolManager pm, address token_, address factory_) {
+        if (address(pm) == address(0) || token_ == address(0) || factory_ == address(0)) revert BadConfig();
         poolManager = pm;
         token = IPimdToken(token_);
+        LAUNCH_FACTORY = factory_;
         Hooks.validateHookPermissions(this, getHookPermissions());
     }
 
@@ -248,10 +259,15 @@ contract PimdHook is IHooks, IUnlockCallback {
         // derived from it and the engine only ever books this token, so anything else is unrecoverable.
         if (c0 != quoteToken()) revert WrongQuoteCurrency(c0);
 
+        // The opening price is NOT gated. The pad's factory sets it from the chain policy's
+        // `initialMarketCaps` -- 2,500 IMD for the IMD pairing, which is what `LAUNCH_TICK` records -- and it
+        // expects the hook to accept the pool it opens. Launch 1405's admission harness told us so directly:
+        // "accept the pool it opens (the launch token, the paired currency, the manifest's fee and tick
+        // spacing)". SovrnHook, which the pad admitted, takes its `beforeInitialize` price argument unnamed
+        // and never looks at it. So the tick is read for the event and for anyone watching, and the opening
+        // price rests on the policy rather than on this contract. Everything else here is still refused:
+        // the caller, a second pool, the pairing, the quote currency and the fee tier.
         int24 tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
-        if (tick < LAUNCH_TICK - LAUNCH_TICK_TOLERANCE || tick > LAUNCH_TICK + LAUNCH_TICK_TOLERANCE) {
-            revert WrongStartingPrice(tick, LAUNCH_TICK);
-        }
 
         quote = key.currency0;
         quoteId = uint256(uint160(c0));

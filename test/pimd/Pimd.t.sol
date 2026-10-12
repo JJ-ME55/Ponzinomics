@@ -322,21 +322,31 @@ contract PimdTest is PimdBaseTest {
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
     }
 
-    function test_initialize_refuses_a_mispriced_pool() public {
+    /// The hook used to refuse any opening price outside `LAUNCH_TICK` +/- `LAUNCH_TICK_TOLERANCE`, and that
+    /// is why launch 1405 parked: the pad sets the opening price from the chain policy's `initialMarketCaps`
+    /// and its admission harness requires the hook to "accept the pool it opens". So the price is now the
+    /// factory's responsibility, not this contract's, and this test holds that line in the other direction --
+    /// it fails if anyone reinstates the gate.
+    ///
+    /// What protects the opening price instead: policy v30 pins the IMD pairing at a 2,500 IMD cap, which is
+    /// the tick `LAUNCH_TICK` records. That is a policy guarantee rather than a contract one, and the
+    /// difference is deliberate and documented.
+    function test_initialize_does_not_gate_the_opening_price() public {
         (PimdHook fresh, PimdToken t) = _freshHook();
         PoolKey memory k = _keyFor(fresh, t, 12_500);
-        // a thousand ticks away from the briefed opening, far outside the tolerance
-        vm.expectRevert();
+        // A thousand ticks from the briefed opening, far outside what the old tolerance allowed.
         vm.prank(address(factory));
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK + 1000));
+        assertTrue(fresh.launched(), "the hook accepts the price the factory opens at");
+        assertEq(fresh.LAUNCH_TICK(), START_TICK, "LAUNCH_TICK still records what the policy implies");
     }
 
-    function test_initialize_accepts_a_price_inside_the_tolerance() public {
+    function test_initialize_accepts_the_briefed_price() public {
         (PimdHook fresh, PimdToken t) = _freshHook();
         PoolKey memory k = _keyFor(fresh, t, 12_500);
         vm.prank(address(factory));
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK - 120));
-        assertTrue(fresh.launched(), "a near-enough price opens");
+        assertTrue(fresh.launched(), "the briefed price opens");
     }
 
     /// Audit finding, HIGH: initialize is permissionless on the PoolManager and this hook launches once,

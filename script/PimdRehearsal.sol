@@ -16,12 +16,11 @@ import {PimdToken} from "../src/pimd/PimdToken.sol";
 ///         keeper can be driven through whole epochs before a paid launch, which is the one thing no audit
 ///         covers: audits read the contracts, and the keeper is JavaScript.
 ///
-/// Deliberately the REAL `PimdHook`, not the test harness: its constructor takes only the pool manager and
-/// the token, and every other address -- the engine, the team wallet, IMD, the launch factory -- is a source
-/// constant. On a fork of the real chain those constants point at the real things, so the only thing that has
-/// to be faked is the factory's *code*, which the runner places at the hook's hardcoded `LAUNCH_FACTORY`
-/// address with `anvil_setCode`. Nothing here is reachable on a real chain: it is not deployed by
-/// `DeployPimd.s.sol` and the launch request does not name it.
+/// Deliberately the REAL `PimdHook`, not the test harness: its constructor takes the pool manager, the token
+/// and the launch factory, and every other address -- the engine, the team wallet, IMD -- is a source
+/// constant. On a fork of the real chain those constants point at the real things, and the factory is simply
+/// passed in, so the seeder can play that part directly. Nothing here is reachable on a real chain: it is not
+/// deployed by `DeployPimd.s.sol` and the launch request does not name it.
 ///
 /// Used by `pulse-imd/rehearse/rehearse.sh`.
 contract PimdRehearsal {
