@@ -51,15 +51,41 @@ contract PimdRehearsal {
         return HOOK_FLAGS;
     }
 
-    /// CREATE2-deploys the hook from a salt mined by `cast create2 --deployer <this>`. The init code arrives
-    /// as calldata rather than being embedded, which is what keeps this contract under the create limit, and
-    /// deploying from here rather than the canonical proxy means the mined deployer address is one we control
-    /// and does not have to exist on the forked chain.
-    function deployHook(bytes32 salt, bytes calldata initcode) external returns (address h) {
+    /// The hook's init code, uploaded in pieces. Passing 16KB of hex as a command-line argument broke the
+    /// Windows argument limit once the hook grew, and embedding it here broke the 24,576-byte create limit,
+    /// so it arrives in chunks and is assembled in memory at deploy time. Chunks are stored separately
+    /// rather than concatenated on each append, so no single call rewrites the whole array.
+    mapping(uint256 => bytes) private _chunks;
+    uint256 public chunkCount;
+
+    function appendCode(bytes calldata chunk) external {
+        _chunks[chunkCount++] = chunk;
+    }
+
+    function resetCode() external {
+        chunkCount = 0;
+    }
+
+    function initCode() public view returns (bytes memory out) {
+        for (uint256 i; i < chunkCount; ++i) {
+            out = bytes.concat(out, _chunks[i]);
+        }
+    }
+
+    /// Lets the runner confirm the uploaded bytes are the ones the salt was mined against, before spending a
+    /// deployment on them.
+    function initCodeHash() external view returns (bytes32) {
+        return keccak256(initCode());
+    }
+
+    /// CREATE2-deploys the hook from a salt mined by `cast create2 --deployer <this>`. Deploying from here
+    /// rather than the canonical proxy means the mined deployer address is one we control and does not have
+    /// to exist on the forked chain.
+    function deployHookFromStore(bytes32 salt) external returns (address h) {
+        bytes memory code = initCode();
+        require(code.length != 0, "no init code uploaded");
         assembly {
-            let p := mload(0x40)
-            calldatacopy(p, initcode.offset, initcode.length)
-            h := create2(0, p, initcode.length, salt)
+            h := create2(0, add(code, 0x20), mload(code), salt)
         }
         require(h != address(0), "hook create2 failed");
         require(uint160(h) & 0x3fff == HOOK_FLAGS, "hook address does not encode the permissions");

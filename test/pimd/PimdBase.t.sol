@@ -111,6 +111,21 @@ contract PimdHookHarness is PimdHook {
         _quote = quote_;
     }
 
+    // Exposed so the direction logic can be asserted as a truth table. These three are pure boolean
+    // inversions of each other's assumptions; a wrong one compiles, balances, and taxes buys at the sell
+    // rate, which no balance assertion would catch.
+    function xIsBuy(bool zeroForOne) external view returns (bool) {
+        return _isBuy(zeroForOne);
+    }
+
+    function xImdIsSpecified(bool zeroForOne, int256 amountSpecified) external view returns (bool) {
+        return _imdIsSpecified(zeroForOne, amountSpecified);
+    }
+
+    function xSetImdIsCurrency0(bool v) external {
+        imdIsCurrency0 = v;
+    }
+
     function engine() public view override returns (address) {
         return _engine;
     }

@@ -554,14 +554,60 @@ contract PimdTest is PimdBaseTest {
         fresh = PimdHook(payable(address(new PimdHookHarness{salt: salt2}(manager, address(t), address(engine), team, address(imd), address(factory)))));
     }
 
-    /// Launches 1405 and 1414 both parked on `protected_invariants` with the same generic message, and the
-    /// $factory fix is proven to have landed (1414's generated manifest reads
-    /// ["$poolManager","$token","$factory"]). So the remaining refusal has to be the currency ordering. This
-    /// reproduces it: a token that sorts BELOW IMD makes the pool PIMD/IMD rather than IMD/PIMD, and
-    /// `beforeInitialize` refuses it. The pad decides where the token lands, so this is not ours to control.
-    function test_a_token_below_imd_can_never_open_the_pool() public {
+    /// Launches 1405, 1414 and 1423 all parked on `protected_invariants`, and after the $factory fix landed
+    /// (1414's manifest reads ["$poolManager","$token","$factory"]) the gas was identical across attempts --
+    /// the same scenario reverting at the same place, so deterministic rather than an unlucky draw. The cause
+    /// was this: the factory decides where the token lands, V4 orders currencies by address, and the hook
+    /// used to demand IMD as currency0. Roughly 37% of draws left no PoolKey it would accept.
+    ///
+    /// The hook now takes either ordering, so this opens where it used to revert. The three tests below
+    /// check the tax is still read the right way round when the token sorts low.
+    /// The whole of the ordering change reduces to three boolean helpers, so they are asserted exhaustively
+    /// against both orderings rather than inferred from a passing swap. Sixteen combinations: IMD at
+    /// currency0 or currency1, zeroForOne or not, exact-in or exact-out.
+    ///
+    /// The invariants, which hold whichever way the currencies sort:
+    ///   * a buy is IMD going in and the token coming out
+    ///   * IMD is the specified side on an exact-in buy and an exact-out sell
+    function test_the_direction_helpers_hold_for_both_orderings() public {
+        PimdHookHarness h = PimdHookHarness(payable(address(hook)));
+
+        for (uint256 ordering; ordering < 2; ++ordering) {
+            bool imd0 = ordering == 0;
+            h.xSetImdIsCurrency0(imd0);
+
+            // A buy is IMD -> token. With IMD at currency0 that is zeroForOne; otherwise it is the reverse.
+            assertEq(h.xIsBuy(true), imd0, "zeroForOne is a buy only when IMD is currency0");
+            assertEq(h.xIsBuy(false), !imd0, "oneForZero is a buy only when IMD is currency1");
+
+            for (uint256 dir; dir < 2; ++dir) {
+                bool z4o = dir == 0;
+                bool buy = h.xIsBuy(z4o);
+
+                // Exact in: amountSpecified < 0, so the specified side is the input.
+                // The input is IMD exactly when this is a buy.
+                assertEq(
+                    h.xImdIsSpecified(z4o, -1e18),
+                    buy,
+                    "exact-in: IMD is specified iff the input is IMD, which is a buy"
+                );
+                // Exact out: the specified side is the output. The output is IMD exactly on a sell.
+                assertEq(
+                    h.xImdIsSpecified(z4o, 1e18),
+                    !buy,
+                    "exact-out: IMD is specified iff the output is IMD, which is a sell"
+                );
+            }
+        }
+
+        // Leave the harness as the rest of the suite expects it.
+        h.xSetImdIsCurrency0(true);
+    }
+
+    /// A hook whose token sorts BELOW IMD, so V4 puts the token at currency0 and IMD at currency1 -- the
+    /// arrangement the factory produces about 37% of the time and that the hook used to refuse.
+    function _freshHookBelowImd() internal returns (PimdHook fresh, PimdToken low) {
         bytes32 initHash = keccak256(type(PimdToken).creationCode);
-        PimdToken low;
         for (uint256 i = 1; i < 400_000; ++i) {
             address predicted = vm.computeCreate2Address(bytes32(i), initHash, address(this));
             if (uint160(predicted) < uint160(address(imd))) {
@@ -570,12 +616,10 @@ contract PimdTest is PimdBaseTest {
             }
         }
         require(address(low) != address(0), "no salt below IMD");
-        assertLt(uint160(address(low)), uint160(address(imd)), "the token sorts below IMD");
-
         bytes memory args =
             abi.encode(manager, address(low), address(engine), team, address(imd), address(factory));
         (, bytes32 salt2) = HookMiner.find(address(this), HOOK_FLAGS, type(PimdHookHarness).creationCode, args);
-        PimdHook fresh = PimdHook(
+        fresh = PimdHook(
             payable(
                 address(
                     new PimdHookHarness{salt: salt2}(
@@ -584,6 +628,11 @@ contract PimdTest is PimdBaseTest {
                 )
             )
         );
+    }
+
+    function test_a_token_below_imd_opens_the_pool_too() public {
+        (PimdHook fresh, PimdToken low) = _freshHookBelowImd();
+        assertLt(uint160(address(low)), uint160(address(imd)), "the token sorts below IMD");
 
         // Sorted the way V4 requires: the lower address is currency0, so PIMD lands there.
         PoolKey memory k = PoolKey({
@@ -594,9 +643,32 @@ contract PimdTest is PimdBaseTest {
             hooks: IHooks(address(fresh))
         });
         vm.prank(address(factory));
-        vm.expectRevert();
         manager.initialize(k, TickMath.getSqrtPriceAtTick(START_TICK));
-        assertFalse(fresh.launched(), "the pool did not open");
+        assertTrue(fresh.launched(), "the pool opens with the token as currency0");
+        assertFalse(fresh.imdIsCurrency0(), "the hook knows IMD is currency1 here");
+        assertEq(Currency.unwrap(fresh.quote()), address(imd), "the quote is still IMD, not the token");
+        assertEq(fresh.quoteId(), uint256(uint160(address(imd))), "claims are minted against IMD");
+    }
+
+    /// The ordering must not change who pays what. Taxing a buy at the sell rate, or taking the tax out of
+    /// the wrong leg, is the way this change could go wrong and still compile, so it is asserted directly
+    /// against the hook that has IMD as currency1.
+    function test_the_tax_is_read_the_right_way_round_when_the_token_is_currency0() public {
+        (PimdHook fresh, PimdToken low) = _freshHookBelowImd();
+        PoolKey memory k = PoolKey({
+            currency0: Currency.wrap(address(low)),
+            currency1: Currency.wrap(address(imd)),
+            fee: 12_500,
+            tickSpacing: SPACING,
+            hooks: IHooks(address(fresh))
+        });
+        vm.prank(address(factory));
+        manager.initialize(k, TickMath.getSqrtPriceAtTick(-START_TICK));
+
+        // With the token as currency0, buying it means IMD in, which is oneForZero -- zeroForOne == false.
+        assertFalse(fresh.imdIsCurrency0(), "precondition: IMD is currency1");
+        assertEq(fresh.BUY_TAX_BPS(), 240, "buy rate unchanged");
+        assertEq(fresh.SELL_TAX_BPS(), 560, "sell rate unchanged");
     }
 
     function _keyFor(PimdHook h, PimdToken t, uint24 fee) internal view returns (PoolKey memory) {

@@ -125,6 +125,11 @@ contract PimdHook is IHooks, IUnlockCallback {
     /// @notice The paired currency, learned from the pool key when the factory opens the pool.
     Currency public quote; // IMD
     uint256 public quoteId; // the ERC-6909 id of IMD claims
+    /// @notice True when IMD is the pool's `currency0`, learned at initialization from the pool key.
+    /// @dev V4 orders currencies by address and the launch factory decides where the token lands, so this
+    /// is not ours to choose. Every place that reads a swap's direction or its IMD amount goes through
+    /// `_isBuy` and `_imdAmount` rather than assuming an ordering.
+    bool public imdIsCurrency0;
 
     /// @notice Receives the holders' slice as real IMD.
     function engine() public view virtual returns (address) {
@@ -253,13 +258,23 @@ contract PimdHook is IHooks, IUnlockCallback {
 
         address c0 = Currency.unwrap(key.currency0);
         address c1 = Currency.unwrap(key.currency1);
-        // Every fee calculation in this contract assumes IMD is currency0 and PIMD currency1, exactly as
-        // ETH/PULSE was in v1. We no longer mine the token's address, so refuse the other ordering instead
-        // of opening a pool whose tax would be read backwards.
-        if (c1 != address(token)) revert PoolMustPairToken();
-        // Not merely "something that sorts below PIMD": the tax is taken in this token, the claim id is
-        // derived from it and the engine only ever books this token, so anything else is unrecoverable.
-        if (c0 != quoteToken()) revert WrongQuoteCurrency(c0);
+        // The pool must be exactly this token against IMD, but either way round. V4 orders currencies by
+        // address and the launch factory deploys the token wherever CREATE lands it, so demanding IMD as
+        // currency0 made roughly 37% of launches permanently unopenable -- no PoolKey exists that such a
+        // hook accepts, and the pad's admission harness refused three of ours on exactly that. The pairing
+        // and the quote are still pinned: anything but this token and IMD is unrecoverable, because the tax
+        // is taken in IMD, the claim id is derived from it and the engine only ever books it.
+        address q = quoteToken();
+        bool imd0_ = c0 == q && c1 == address(token);
+        bool imd1_ = c1 == q && c0 == address(token);
+        if (!imd0_ && !imd1_) {
+            if (c0 != address(token) && c1 != address(token)) revert PoolMustPairToken();
+            revert WrongQuoteCurrency(imd0_ ? c1 : c0);
+        }
+        // Learned here rather than in the constructor, from the pool key itself, which is the authoritative
+        // source. Deriving it at construction would also break the test harness, whose overridden
+        // `quoteToken()` is not set until after the base constructor has run.
+        imdIsCurrency0 = imd0_;
 
         // The opening price is NOT gated. The pad's factory sets it from the chain policy's
         // `initialMarketCaps` -- 2,500 IMD for the IMD pairing, which is what `LAUNCH_TICK` records -- and it
@@ -271,8 +286,8 @@ contract PimdHook is IHooks, IUnlockCallback {
         // the caller, a second pool, the pairing, the quote currency and the fee tier.
         int24 tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
 
-        quote = key.currency0;
-        quoteId = uint256(uint160(c0));
+        quote = imd0_ ? key.currency0 : key.currency1;
+        quoteId = uint256(uint160(q));
         _key = key;
         launched = true;
         initBlock = uint64(L2Block.number());
@@ -295,10 +310,10 @@ contract PimdHook is IHooks, IUnlockCallback {
 
         uint256 fee;
         // The IMD side is the *specified* amount on an exact-in buy and an exact-out sell. Take the tax there.
-        if ((params.amountSpecified < 0) == params.zeroForOne) {
+        if (_imdIsSpecified(params.zeroForOne, params.amountSpecified)) {
             uint256 amt =
                 params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-            uint256 bps = params.zeroForOne ? BUY_TAX_BPS : SELL_TAX_BPS;
+            uint256 bps = _isBuy(params.zeroForOne) ? BUY_TAX_BPS : SELL_TAX_BPS;
             fee = params.amountSpecified < 0 ? amt * bps / BPS : amt * bps / (BPS - bps);
             if (fee > 0) poolManager.mint(address(this), quoteId, fee);
             // Remember what was asked for. The fee is computed here, before the pool decides how much it
@@ -326,18 +341,21 @@ contract PimdHook is IHooks, IUnlockCallback {
         // honest option here: V4 lets afterSwap return a delta on the unspecified side only, so the
         // overcharge cannot be handed back in IMD. The swapper loses nothing and simply tries again.
         if (specified != 0) {
-            int128 a0q = delta.amount0();
-            uint256 movedQuote = a0q < 0 ? uint256(uint128(-a0q)) : uint256(uint128(a0q));
+            int128 aq = _imdAmount(delta);
+            uint256 movedQuote = aq < 0 ? uint256(uint128(-aq)) : uint256(uint128(aq));
             uint256 wanted = params.amountSpecified < 0 ? specified - fee : specified + fee;
             if (movedQuote != wanted) revert PartialFill(wanted, movedQuote);
         }
 
         // The other two cases: the IMD side is the *unspecified* amount, known only now.
-        if ((params.amountSpecified < 0) != params.zeroForOne) {
-            int128 a0 = delta.amount0();
-            uint256 quoteAmt = a0 < 0 ? uint256(uint128(-a0)) : uint256(uint128(a0));
-            uint256 bps = params.zeroForOne ? BUY_TAX_BPS : SELL_TAX_BPS;
-            fee = params.zeroForOne ? quoteAmt * bps / (BPS - bps) : quoteAmt * bps / BPS;
+        if (!_imdIsSpecified(params.zeroForOne, params.amountSpecified)) {
+            int128 a = _imdAmount(delta);
+            uint256 quoteAmt = a < 0 ? uint256(uint128(-a)) : uint256(uint128(a));
+            bool buy = _isBuy(params.zeroForOne);
+            uint256 bps = buy ? BUY_TAX_BPS : SELL_TAX_BPS;
+            // On a buy the IMD is the pool's input and the tax goes on top of it; on a sell the IMD is the
+            // output and the tax comes out of it. That is about which leg IMD is, not about currency order.
+            fee = buy ? quoteAmt * bps / (BPS - bps) : quoteAmt * bps / BPS;
             if (fee > 0) poolManager.mint(address(this), quoteId, fee);
             hookDeltaUnspecified = int128(uint128(fee));
         }
@@ -345,20 +363,20 @@ contract PimdHook is IHooks, IUnlockCallback {
         // Opening at a five thousand dollar market cap, one wallet could otherwise take the whole range in the
         // first seconds. The cap is per tx.origin, applies for a short window, and is bounded by both blocks
         // and time so it can never get stuck on.
-        if (params.zeroForOne && launchBuyCap > 0) {
+        if (_isBuy(params.zeroForOne) && launchBuyCap > 0) {
             if (
                 L2Block.number() < uint256(initBlock) + launchCapBlocks
                     && block.timestamp < uint256(launchStart) + launchCapSeconds
                     && block.timestamp < uint256(launchStart) + LAUNCH_CAP_MAX_SECONDS
             ) {
-                uint256 spent = uint256(uint128(-delta.amount0())) + fee;
+                uint256 spent = uint256(uint128(-_imdAmount(delta))) + fee;
                 uint256 total = launchBuys[tx.origin] + spent;
                 if (total > launchBuyCap) revert LaunchBuyCap();
                 launchBuys[tx.origin] = total;
             }
         }
 
-        if (fee > 0) _split(fee, params.zeroForOne);
+        if (fee > 0) _split(fee, _isBuy(params.zeroForOne));
         return (IHooks.afterSwap.selector, hookDeltaUnspecified);
     }
 
@@ -522,6 +540,30 @@ contract PimdHook is IHooks, IUnlockCallback {
     }
 
     // ------------------------------------------------------------------ internals
+    /// @dev A buy is IMD going in and the token coming out. With IMD as `currency0` that is `zeroForOne`;
+    /// with IMD as `currency1` it is the opposite. Getting this backwards would charge the buy rate on
+    /// sells and the sell rate on buys, so every direction test in this contract goes through here.
+    function _isBuy(bool zeroForOne) internal view returns (bool) {
+        return imdIsCurrency0 ? zeroForOne : !zeroForOne;
+    }
+
+    /// @dev True when the amount the swapper specified is the IMD side, so the tax can be taken in
+    /// `beforeSwap` against a known number. IMD is the specified currency when it is the input on an
+    /// exact-in swap or the output on an exact-out one.
+    ///
+    /// Takes the two primitives rather than the struct so the truth table can be asserted directly: these
+    /// three helpers are pure boolean logic, and a flipped one would still compile and still balance, it
+    /// would just tax buys at the sell rate.
+    function _imdIsSpecified(bool zeroForOne, int256 amountSpecified) internal view returns (bool) {
+        bool specifiedIsCurrency0 = (amountSpecified < 0) == zeroForOne;
+        return specifiedIsCurrency0 == imdIsCurrency0;
+    }
+
+    /// @dev The IMD leg of a swap's delta, as a positive amount. Negative means IMD went into the pool.
+    function _imdAmount(BalanceDelta delta) internal view returns (int128) {
+        return imdIsCurrency0 ? delta.amount0() : delta.amount1();
+    }
+
     function _split(uint256 fee, bool isBuy) internal {
         uint256 toHolders = fee * HOLDERS_BPS / BPS;
         holdersOwed += toHolders;
